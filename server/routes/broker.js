@@ -508,6 +508,88 @@ router.get('/holdings/:connectionId', authenticateToken, async (req, res) => {
   }
 });
 
+// Get broker connection information and available brokers
+router.get('/connect', authenticateToken, async (req, res) => {
+  try {
+    // Return information about available brokers and connection limits
+    const existingConnections = await db.allAsync(
+      'SELECT COUNT(*) as count FROM broker_connections WHERE user_id = ? AND is_active = 1',
+      [req.user.id]
+    );
+
+    const brokerConfigs = brokerConfigService.getAllBrokers();
+    
+    res.json({
+      availableBrokers: brokerConfigs,
+      connectionLimits: {
+        maxConnections: 5,
+        currentConnections: existingConnections[0].count
+      },
+      supportedBrokers: [
+        'zerodha',
+        'upstox', 
+        'angel',
+        'shoonya',
+        '5paisa'
+      ]
+    });
+
+  } catch (error) {
+    logger.error('Get connect info error:', error);
+    res.status(500).json({ error: 'Failed to fetch connection information' });
+  }
+});
+
+// Get broker authentication URL (for OAuth brokers)
+router.get('/connect/:connectionId/auth-url', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ?',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const state = JSON.stringify({ 
+      connection_id: connectionId,
+      user_id: req.user.id,
+      reconnect: false 
+    });
+    
+    let authUrl = '';
+    
+    if (connection.broker_name.toLowerCase() === 'zerodha') {
+      const apiKey = decryptData(connection.api_key);
+      const redirectUrl = `${baseUrl}/api/broker/auth/zerodha/callback`;
+      authUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
+    } else if (connection.broker_name.toLowerCase() === 'upstox') {
+      const apiKey = decryptData(connection.api_key);
+      const redirectUrl = connection.redirect_uri || `${baseUrl}/api/broker/auth/upstox/callback`;
+      authUrl = `https://api.upstox.com/v2/login/authorization/dialog?client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&response_type=code&state=${encodeURIComponent(state)}`;
+    } else {
+      return res.status(400).json({ 
+        error: `Authentication URL generation not supported for ${connection.broker_name}` 
+      });
+    }
+
+    res.json({
+      authUrl,
+      connectionId,
+      brokerName: connection.broker_name,
+      redirectUrl: connection.redirect_uri || `${baseUrl}/api/broker/auth/${connection.broker_name.toLowerCase()}/callback`
+    });
+
+  } catch (error) {
+    logger.error('Auth URL generation error:', error);
+    res.status(500).json({ error: 'Failed to generate authentication URL' });
+  }
+});
+
 // Connect broker - Step 1: Store credentials and generate login URL
 router.post('/connect', authenticateToken, async (req, res) => {
   try {
@@ -967,6 +1049,221 @@ router.post('/refresh-token/:connectionId', authenticateToken, async (req, res) 
   } catch (error) {
     logger.error('Token refresh error:', error);
     res.status(500).json({ error: 'Failed to refresh token' });
+  }
+});
+
+// Upstox OAuth callback handler
+router.get('/auth/upstox/callback', async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+
+    logger.info('Upstox callback received:', { code: !!code, state, error });
+
+    // Check if authentication was successful
+    if (error || !code) {
+      return res.status(400).send(`
+        <html>
+          <head><title>Authentication Failed</title></head>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: #dc3545;">❌ Authentication Failed</h1>
+            <p>Upstox authentication was not successful.</p>
+            <p>Error: ${error || 'No authorization code received'}</p>
+            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+          </body>
+        </html>
+      `);
+    }
+
+    // Parse the state parameter
+    let connectionId, reconnect, userId;
+    try {
+      const stateObj = state ? JSON.parse(decodeURIComponent(state)) : {};
+      connectionId = stateObj.connection_id;
+      userId = stateObj.user_id;
+      reconnect = stateObj.reconnect;
+      
+      logger.info('Parsed state parameter:', { connectionId, userId, reconnect });
+    } catch (e) {
+      logger.error('Failed to parse state parameter:', e);
+      // State parsing failed, but we'll try to find the connection below
+    }
+
+    // If no connection ID from state, try to find the most recent Upstox connection that needs authentication
+    if (!connectionId) {
+      logger.warn('No connection ID in state, attempting to find recent Upstox connection');
+      
+      try {
+        const recentConnection = await db.getAsync(`
+          SELECT id, user_id, broker_name, connection_name, created_at
+          FROM broker_connections 
+          WHERE broker_name = 'upstox' 
+            AND is_active = 1 
+            AND (access_token IS NULL OR access_token = '')
+          ORDER BY created_at DESC 
+          LIMIT 1
+        `);
+        
+        if (recentConnection) {
+          connectionId = recentConnection.id;
+          userId = recentConnection.user_id;
+          logger.info('Found recent Upstox connection:', { 
+            connectionId, 
+            userId, 
+            connectionName: recentConnection.connection_name 
+          });
+        }
+      } catch (dbError) {
+        logger.error('Failed to find recent connection:', dbError);
+      }
+    }
+
+    if (!connectionId) {
+      return res.status(400).send(`
+        <html>
+          <head><title>Missing Connection ID</title></head>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: #dc3545;">❌ Missing Connection ID</h1>
+            <p>Connection ID is required for authentication.</p>
+            <p><strong>Debug Info:</strong> State parameter was missing or invalid.</p>
+            <p>Please try the authentication process again from the beginning.</p>
+            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+          </body>
+        </html>
+      `);
+    }
+
+    // Get broker connection
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ?',
+      [connectionId]
+    );
+
+    if (!connection) {
+      return res.status(404).send(`
+        <html>
+          <head><title>Connection Not Found</title></head>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: #dc3545;">❌ Connection Not Found</h1>
+            <p>Broker connection not found.</p>
+            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+          </body>
+        </html>
+      `);
+    }
+
+    try {
+      // Check if encrypted credentials exist
+      if (!connection.api_key) {
+        throw new Error('API key not found in connection');
+      }
+      if (!connection.encrypted_api_secret) {
+        throw new Error('API secret not found in connection');
+      }
+
+      // Decrypt credentials
+      logger.info('Decrypting credentials for connection:', connectionId);
+      const apiKey = decryptData(connection.api_key);
+      const apiSecret = decryptData(connection.encrypted_api_secret);
+      
+      // Get redirect URI from the connection or construct it
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      const redirectUri = connection.redirect_uri || `${baseUrl}/api/broker/auth/upstox/callback`;
+      
+      logger.info('Generating access token for connection:', connectionId);
+      
+      // Generate access token using Upstox API
+      const tokenResponse = await upstoxService.generateAccessToken(apiKey, apiSecret, code, redirectUri);
+      
+      if (!tokenResponse || !tokenResponse.access_token) {
+        throw new Error('Failed to generate access token');
+      }
+
+      const accessToken = tokenResponse.access_token;
+      const refreshToken = tokenResponse.refresh_token;
+      
+      // Set token expiry
+      const expiresIn = tokenResponse.expires_in || 86400; // Default 24 hours
+      const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+
+      // Store access token and refresh token
+      const encryptedAccessToken = encryptData(accessToken);
+      const encryptedRefreshToken = refreshToken ? encryptData(refreshToken) : null;
+
+      await db.runAsync(`
+        UPDATE broker_connections 
+        SET access_token = ?, refresh_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
+        WHERE id = ?
+      `, [encryptedAccessToken, encryptedRefreshToken, expiresAt, connectionId]);
+
+      logger.info('Upstox authentication completed for connection:', connectionId);
+
+      const actionText = reconnect ? 'Reconnection Successful' : 'Authentication Successful';
+
+      // Return success page
+      res.send(`
+        <html>
+          <head>
+            <title>${actionText}</title>
+            <style>
+              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f8f9fa; }
+              .success-container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 500px; margin: 0 auto; }
+              .success-icon { font-size: 48px; margin-bottom: 20px; }
+              .success-title { color: #28a745; margin-bottom: 15px; }
+              .success-message { color: #6c757d; margin-bottom: 30px; line-height: 1.6; }
+              .close-btn { padding: 12px 24px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+              .close-btn:hover { background: #218838; }
+            </style>
+          </head>
+          <body>
+            <div class="success-container">
+              <div class="success-icon">✅</div>
+              <h1 class="success-title">${actionText}!</h1>
+              <p class="success-message">
+                Your Upstox account has been successfully ${reconnect ? 'reconnected' : 'connected'} to AutoTraderHub.<br>
+                Access token expires: ${new Date(expiresAt * 1000).toLocaleString()}<br>
+                You can now close this window and return to the dashboard.
+              </p>
+              <button class="close-btn" onclick="window.close()">Close Window</button>
+            </div>
+            <script>
+              // Auto-close after 5 seconds
+              setTimeout(() => {
+                window.close();
+              }, 5000);
+            </script>
+          </body>
+        </html>
+      `);
+
+    } catch (authError) {
+      logger.error('Upstox authentication error:', authError);
+      res.status(500).send(`
+        <html>
+          <head><title>Authentication Error</title></head>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1 style="color: #dc3545;">❌ Authentication Error</h1>
+            <p>Failed to complete Upstox authentication.</p>
+            <p><strong>Error:</strong> ${authError.message}</p>
+            <p>Please check your credentials and try again.</p>
+            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+          </body>
+        </html>
+      `);
+    }
+
+  } catch (error) {
+    logger.error('Upstox callback error:', error);
+    res.status(500).send(`
+      <html>
+        <head><title>Server Error</title></head>
+        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+          <h1 style="color: #dc3545;">❌ Server Error</h1>
+          <p>An unexpected error occurred during authentication.</p>
+          <p>Please try again or contact support if the issue persists.</p>
+          <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
+        </body>
+      </html>
+    `);
   }
 });
 
