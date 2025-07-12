@@ -9,6 +9,7 @@ import angelService from '../services/angelService.js';
 import shoonyaService from '../services/shoonyaService.js';
 import brokerConfigService from '../services/brokerConfigService.js';
 import createLogger from '../utils/logger.js';
+import BrokerAuthDiagnostics from '../utils/brokerAuthDiagnostics.js';
 
 const logger = createLogger('BrokerHandler');
 
@@ -16,6 +17,123 @@ const router = express.Router();
 
 // Test encryption on startup
 testEncryption();
+
+// Utility function to validate token and handle expiration
+const validateTokenAndHandleExpiration = async (connection, res, logger) => {
+  const now = Math.floor(Date.now() / 1000);
+  
+  if (!connection.access_token) {
+    logger.warn(`No access token found for connection ${connection.id}`);
+    return {
+      valid: false,
+      response: res.status(401).json({ 
+        error: 'No access token found. Please authenticate first.',
+        needsAuth: true,
+        connectionId: connection.id
+      })
+    };
+  }
+
+  if (connection.access_token_expires_at && connection.access_token_expires_at < now) {
+    logger.warn(`Access token expired for connection ${connection.id}`);
+    
+    // Mark connection as needing authentication
+    try {
+      await db.runAsync(
+        'UPDATE broker_connections SET is_authenticated = 0 WHERE id = ?',
+        [connection.id]
+      );
+    } catch (dbError) {
+      logger.error('Failed to update connection authentication status:', dbError);
+    }
+    
+    return {
+      valid: false,
+      response: res.status(401).json({ 
+        error: 'Access token has expired. Please reconnect your account.',
+        tokenExpired: true,
+        connectionId: connection.id
+      })
+    };
+  }
+
+  // Check if token expires soon (within 1 hour) and warn
+  const tokenExpiresIn = connection.access_token_expires_at - now;
+  if (connection.access_token_expires_at && tokenExpiresIn < 3600 && tokenExpiresIn > 0) {
+    logger.warn(`Token expires soon for connection ${connection.id}: ${Math.floor(tokenExpiresIn / 60)} minutes remaining`);
+  }
+
+  return { valid: true };
+};
+
+// Batch health check for all connections
+router.get('/connections/health', authenticateToken, async (req, res) => {
+  try {
+    const connections = await db.allAsync(`
+      SELECT 
+        id, broker_name, connection_name, is_active, 
+        access_token_expires_at, is_authenticated,
+        CASE WHEN access_token IS NOT NULL AND access_token != '' THEN 1 ELSE 0 END as has_token
+      FROM broker_connections 
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+    `, [req.user.id]);
+
+    const now = Math.floor(Date.now() / 1000);
+    const healthStatuses = [];
+
+    for (const connection of connections) {
+      const tokenExpired = connection.access_token_expires_at && connection.access_token_expires_at < now;
+      const tokenExpiresIn = connection.access_token_expires_at ? connection.access_token_expires_at - now : null;
+      
+      let healthStatus = 'healthy';
+      let issues = [];
+
+      if (!connection.is_active) {
+        healthStatus = 'inactive';
+        issues.push('Connection is inactive');
+      } else if (!connection.has_token) {
+        healthStatus = 'needs_auth';
+        issues.push('Missing access token');
+      } else if (tokenExpired) {
+        healthStatus = 'token_expired';
+        issues.push('Access token has expired');
+      } else if (tokenExpiresIn && tokenExpiresIn < 3600) {
+        healthStatus = 'warning';
+        issues.push(`Token expires in ${Math.floor(tokenExpiresIn / 60)} minutes`);
+      }
+
+      healthStatuses.push({
+        connectionId: connection.id,
+        brokerName: connection.broker_name,
+        connectionName: connection.connection_name,
+        healthStatus,
+        issues,
+        tokenExpired,
+        tokenExpiresIn
+      });
+    }
+
+    const summary = {
+      total: healthStatuses.length,
+      healthy: healthStatuses.filter(h => h.healthStatus === 'healthy').length,
+      warning: healthStatuses.filter(h => h.healthStatus === 'warning').length,
+      needsAuth: healthStatuses.filter(h => h.healthStatus === 'needs_auth').length,
+      tokenExpired: healthStatuses.filter(h => h.healthStatus === 'token_expired').length,
+      inactive: healthStatuses.filter(h => h.healthStatus === 'inactive').length
+    };
+
+    res.json({
+      summary,
+      connections: healthStatuses,
+      lastChecked: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Batch health check error:', error);
+    res.status(500).json({ error: 'Failed to check connections health' });
+  }
+});
 
 // Get broker connections with enhanced data
 router.get('/connections', authenticateToken, async (req, res) => {
@@ -42,6 +160,81 @@ router.get('/connections', authenticateToken, async (req, res) => {
   } catch (error) {
     logger.error('Get connections error:', error);
     res.status(500).json({ error: 'Failed to fetch connections' });
+  }
+});
+
+// Check connection health and authentication status
+router.get('/connections/:id/health', authenticateToken, async (req, res) => {
+  try {
+    const connection = await db.getAsync(`
+      SELECT 
+        id, broker_name, connection_name, is_active, 
+        access_token_expires_at, is_authenticated,
+        CASE WHEN access_token IS NOT NULL AND access_token != '' THEN 1 ELSE 0 END as has_token
+      FROM broker_connections 
+      WHERE id = ? AND user_id = ?
+    `, [req.params.id, req.user.id]);
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found' });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const tokenExpired = connection.access_token_expires_at && connection.access_token_expires_at < now;
+    const tokenExpiresIn = connection.access_token_expires_at ? connection.access_token_expires_at - now : null;
+    
+    let healthStatus = 'healthy';
+    let issues = [];
+
+    if (!connection.is_active) {
+      healthStatus = 'inactive';
+      issues.push('Connection is inactive');
+    }
+
+    if (!connection.has_token) {
+      healthStatus = 'needs_auth';
+      issues.push('Missing access token');
+    } else if (tokenExpired) {
+      healthStatus = 'token_expired';
+      issues.push('Access token has expired');
+    } else if (tokenExpiresIn && tokenExpiresIn < 3600) {
+      healthStatus = 'warning';
+      issues.push(`Token expires in ${Math.floor(tokenExpiresIn / 60)} minutes`);
+    }
+
+    // Test broker connection if healthy
+    let brokerConnected = false;
+    if (healthStatus === 'healthy' || healthStatus === 'warning') {
+      try {
+        if (connection.broker_name.toLowerCase() === 'zerodha') {
+          await kiteService.getProfile(connection.id);
+          brokerConnected = true;
+        } else if (connection.broker_name.toLowerCase() === 'upstox') {
+          await upstoxService.getProfile(connection.id);
+          brokerConnected = true;
+        }
+        // Add other brokers as needed
+      } catch (testError) {
+        logger.warn(`Broker connection test failed for ${connection.id}:`, testError.message);
+        healthStatus = 'connection_failed';
+        issues.push(`Broker API test failed: ${testError.message}`);
+      }
+    }
+
+    res.json({
+      connectionId: connection.id,
+      brokerName: connection.broker_name,
+      healthStatus,
+      issues,
+      brokerConnected,
+      tokenExpired,
+      tokenExpiresIn,
+      lastChecked: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Health check error:', error);
+    res.status(500).json({ error: 'Failed to check connection health' });
   }
 });
 
@@ -89,20 +282,10 @@ router.get('/positions/:connectionId', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Broker connection not found or inactive' });
     }
 
-    if (!connection.access_token) {
-      return res.status(400).json({ 
-        error: 'No access token found. Please authenticate first.',
-        needsAuth: true 
-      });
-    }
-
-    // Check if token is expired
-    const now = Math.floor(Date.now() / 1000);
-    if (connection.access_token_expires_at && connection.access_token_expires_at < now) {
-      return res.status(400).json({ 
-        error: 'Access token has expired. Please reconnect your account.',
-        tokenExpired: true 
-      });
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
     }
 
     let positions = [];
@@ -186,7 +369,7 @@ router.get('/positions/:connectionId', authenticateToken, async (req, res) => {
     } catch (brokerError) {
       logger.error('Failed to fetch positions from broker:', brokerError);
       
-      if (brokerError.message && brokerError.message.includes('api_key') || brokerError.message.includes('access_token')) {
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
         return res.status(401).json({ 
           error: 'Invalid or expired credentials. Please reconnect your account.',
           tokenExpired: true,
@@ -223,20 +406,10 @@ router.get('/holdings/:connectionId', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Broker connection not found or inactive' });
     }
 
-    if (!connection.access_token) {
-      return res.status(400).json({ 
-        error: 'No access token found. Please authenticate first.',
-        needsAuth: true 
-      });
-    }
-
-    // Check if token is expired
-    const now = Math.floor(Date.now() / 1000);
-    if (connection.access_token_expires_at && connection.access_token_expires_at < now) {
-      return res.status(400).json({ 
-        error: 'Access token has expired. Please reconnect your account.',
-        tokenExpired: true 
-      });
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
     }
 
     let holdings = [];
@@ -315,7 +488,7 @@ router.get('/holdings/:connectionId', authenticateToken, async (req, res) => {
     } catch (brokerError) {
       logger.error('Failed to fetch holdings from broker:', brokerError);
       
-      if (brokerError.message && brokerError.message.includes('api_key') || brokerError.message.includes('access_token')) {
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
         return res.status(401).json({ 
           error: 'Invalid or expired credentials. Please reconnect your account.',
           tokenExpired: true,
@@ -467,15 +640,30 @@ router.post('/connect', authenticateToken, async (req, res) => {
 
     // Handle different broker authentication flows based on auth method
     if (brokerConfig.authMethod === 'oauth') {
-      // Generate OAuth URL for Zerodha
+      // Generate OAuth URL with proper redirect and state parameters
       let authUrl;
+      const baseUrl = `${req.protocol}://${req.get('host')}`;
+      const state = JSON.stringify({ 
+        connection_id: connectionId,
+        user_id: req.user.id,
+        reconnect: false 
+      });
       
       if (brokerName.toLowerCase() === 'zerodha') {
-        authUrl = `https://kite.trade/connect/login?api_key=${apiKey}&v=3`;
+        const redirectUrl = `${baseUrl}/api/broker/auth/zerodha/callback`;
+        authUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
+        
+        logger.info('Generated Zerodha login URL:', {
+          connectionId,
+          redirectUrl,
+          state: state.substring(0, 50) + '...'
+        });
       } else if (brokerName.toLowerCase() === 'upstox') {
-        authUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+        const redirectUrl = `${baseUrl}/api/broker/auth/upstox/callback`;
+        authUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
       } else if (brokerName.toLowerCase() === '5paisa') {
-        authUrl = `https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey=${apiKey}&ResponseURL=${encodeURIComponent(redirectUri)}`;
+        const redirectUrl = redirectUri || `${baseUrl}/api/broker/auth/5paisa/callback`;
+        authUrl = `https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey=${apiKey}&ResponseURL=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
       }
       
       res.json({
@@ -536,7 +724,7 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
     try {
       // Decrypt stored credentials
       const apiKey = decryptData(connection.api_key);
-      const apiSecret = decryptData(connection.api_secret);
+      const apiSecret = decryptData(connection.encrypted_api_secret);
       
       logger.info('Using stored credentials to reconnect');
 
@@ -613,6 +801,175 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
   }
 });
 
+// Test endpoint to verify authentication URL generation
+router.get('/test-auth-url/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'Test endpoints not available in production' });
+    }
+
+    const { connectionId } = req.params;
+    
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ?',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    const state = JSON.stringify({ 
+      connection_id: connectionId,
+      user_id: req.user.id,
+      reconnect: false 
+    });
+    
+    const apiKey = decryptData(connection.api_key);
+    const redirectUrl = `${baseUrl}/api/broker/auth/zerodha/callback`;
+    const authUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
+
+    res.json({
+      connectionId,
+      brokerName: connection.broker_name,
+      authUrl,
+      redirectUrl,
+      state: JSON.parse(state),
+      stateEncoded: encodeURIComponent(state)
+    });
+
+  } catch (error) {
+    logger.error('Test auth URL error:', error);
+    res.status(500).json({ error: 'Failed to generate test auth URL' });
+  }
+});
+
+// Diagnostics endpoint for debugging authentication issues
+router.get('/connections/:id/diagnostics', authenticateToken, async (req, res) => {
+  try {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'Diagnostics not available in production' });
+    }
+
+    const { id: connectionId } = req.params;
+    const diagnostics = await BrokerAuthDiagnostics.diagnoseConnection(connectionId, req.user.id);
+    
+    res.json({
+      connectionId,
+      userId: req.user.id,
+      timestamp: new Date().toISOString(),
+      ...diagnostics
+    });
+
+  } catch (error) {
+    logger.error('Diagnostics error:', error);
+    res.status(500).json({ error: 'Failed to run diagnostics' });
+  }
+});
+
+// Batch diagnostics for all user connections
+router.get('/diagnostics', authenticateToken, async (req, res) => {
+  try {
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'Diagnostics not available in production' });
+    }
+
+    const diagnostics = await BrokerAuthDiagnostics.diagnoseAllConnections(req.user.id);
+    
+    res.json({
+      userId: req.user.id,
+      timestamp: new Date().toISOString(),
+      results: diagnostics
+    });
+
+  } catch (error) {
+    logger.error('Batch diagnostics error:', error);
+    res.status(500).json({ error: 'Failed to run batch diagnostics' });
+  }
+});
+
+// Token refresh endpoint for brokers that support it
+router.post('/refresh-token/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Check if broker supports token refresh
+    if (!connection.refresh_token) {
+      return res.status(400).json({ 
+        error: 'Token refresh not supported or refresh token not available for this broker',
+        requiresReconnect: true 
+      });
+    }
+
+    try {
+      let newTokens;
+      
+      if (connection.broker_name.toLowerCase() === 'upstox') {
+        // Upstox supports token refresh
+        newTokens = await upstoxService.refreshAccessToken(connectionId);
+      } else {
+        // Most other brokers don't support refresh, require full re-auth
+        return res.status(400).json({
+          error: `Token refresh not supported for ${connection.broker_name}. Please reconnect your account.`,
+          requiresReconnect: true
+        });
+      }
+
+      if (newTokens && newTokens.access_token) {
+        // Update tokens in database
+        const encryptedAccessToken = encryptData(newTokens.access_token);
+        const expiresAt = Math.floor(Date.now() / 1000) + (newTokens.expires_in || 86400); // Default 24 hours
+
+        await db.runAsync(`
+          UPDATE broker_connections 
+          SET access_token = ?, access_token_expires_at = ?, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP
+          WHERE id = ?
+        `, [encryptedAccessToken, expiresAt, connectionId]);
+
+        logger.info(`Token refreshed successfully for connection ${connectionId}`);
+        
+        res.json({
+          success: true,
+          message: 'Access token refreshed successfully',
+          expiresAt: expiresAt,
+          expiresIn: newTokens.expires_in || 86400
+        });
+      } else {
+        throw new Error('Invalid refresh response from broker');
+      }
+
+    } catch (refreshError) {
+      logger.error('Token refresh failed:', refreshError);
+      
+      // Mark as needing re-authentication
+      await db.runAsync(
+        'UPDATE broker_connections SET is_authenticated = 0 WHERE id = ?',
+        [connectionId]
+      );
+
+      res.status(400).json({
+        error: 'Token refresh failed. Please reconnect your account.',
+        details: refreshError.message,
+        requiresReconnect: true
+      });
+    }
+
+  } catch (error) {
+    logger.error('Token refresh error:', error);
+    res.status(500).json({ error: 'Failed to refresh token' });
+  }
+});
+
 // Zerodha OAuth callback handler
 router.get('/auth/zerodha/callback', async (req, res) => {
   try {
@@ -636,23 +993,46 @@ router.get('/auth/zerodha/callback', async (req, res) => {
     }
 
     // Parse the state parameter
-    let connectionId, reconnect;
+    let connectionId, reconnect, userId;
     try {
       const stateObj = state ? JSON.parse(decodeURIComponent(state)) : {};
       connectionId = stateObj.connection_id;
+      userId = stateObj.user_id;
       reconnect = stateObj.reconnect;
+      
+      logger.info('Parsed state parameter:', { connectionId, userId, reconnect });
     } catch (e) {
-      logger.error('Failed to parse state:', e);
-      return res.status(400).send(`
-        <html>
-          <head><title>Invalid State</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Invalid State Parameter</h1>
-            <p>Could not identify the connection. Please try again.</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
+      logger.error('Failed to parse state parameter:', e);
+      // State parsing failed, but we'll try to find the connection below
+    }
+
+    // If no connection ID from state, try to find the most recent Zerodha connection that needs authentication
+    if (!connectionId) {
+      logger.warn('No connection ID in state, attempting to find recent Zerodha connection');
+      
+      try {
+        const recentConnection = await db.getAsync(`
+          SELECT id, user_id, broker_name, connection_name, created_at
+          FROM broker_connections 
+          WHERE broker_name = 'zerodha' 
+            AND is_active = 1 
+            AND (access_token IS NULL OR access_token = '')
+          ORDER BY created_at DESC 
+          LIMIT 1
+        `);
+        
+        if (recentConnection) {
+          connectionId = recentConnection.id;
+          userId = recentConnection.user_id;
+          logger.info('Found recent Zerodha connection:', { 
+            connectionId, 
+            userId, 
+            connectionName: recentConnection.connection_name 
+          });
+        }
+      } catch (dbError) {
+        logger.error('Failed to find recent connection:', dbError);
+      }
     }
 
     if (!connectionId) {
@@ -662,6 +1042,8 @@ router.get('/auth/zerodha/callback', async (req, res) => {
           <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
             <h1 style="color: #dc3545;">❌ Missing Connection ID</h1>
             <p>Connection ID is required for authentication.</p>
+            <p><strong>Debug Info:</strong> State parameter was missing or invalid.</p>
+            <p>Please try the authentication process again from the beginning.</p>
             <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
           </body>
         </html>
@@ -688,9 +1070,18 @@ router.get('/auth/zerodha/callback', async (req, res) => {
     }
 
     try {
+      // Check if encrypted credentials exist
+      if (!connection.api_key) {
+        throw new Error('API key not found in connection');
+      }
+      if (!connection.encrypted_api_secret) {
+        throw new Error('API secret not found in connection');
+      }
+
       // Decrypt credentials
+      logger.info('Decrypting credentials for connection:', connectionId);
       const apiKey = decryptData(connection.api_key);
-      const apiSecret = decryptData(connection.api_secret);
+      const apiSecret = decryptData(connection.encrypted_api_secret);
       
       logger.info('Generating access token for connection:', connectionId);
       
@@ -711,12 +1102,12 @@ router.get('/auth/zerodha/callback', async (req, res) => {
       tomorrow.setHours(6, 0, 0, 0); // 6 AM IST
       const expiresAt = Math.floor(tomorrow.getTime() / 1000);
 
-      // Store access token and public token
+      // Store access token
       await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, public_token = ?, access_token_expires_at = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP 
+        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
         WHERE id = ?
-      `, [encryptData(accessToken), encryptData(publicToken), expiresAt, connectionId]);
+      `, [encryptData(accessToken), expiresAt, connectionId]);
 
       // Clear any cached KiteConnect instances to force refresh
       kiteService.clearCachedInstance(connectionId);
@@ -882,7 +1273,7 @@ router.get('/auth/upstox/callback', async (req, res) => {
     try {
       // Decrypt credentials
       const apiKey = decryptData(connection.api_key);
-      const apiSecret = decryptData(connection.api_secret);
+      const apiSecret = decryptData(connection.encrypted_api_secret);
       const redirectUrl = `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`;
       
       logger.info('Generating access token for Upstox connection:', connectionId);
@@ -905,7 +1296,7 @@ router.get('/auth/upstox/callback', async (req, res) => {
       // Store access token
       await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, updated_at = CURRENT_TIMESTAMP 
+        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
         WHERE id = ?
       `, [encryptData(accessToken), expiresAt, connectionId]);
 
@@ -1028,7 +1419,7 @@ router.post('/auth/angel/login', async (req, res) => {
       // Store access token
       await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, updated_at = CURRENT_TIMESTAMP 
+        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
         WHERE id = ?
       `, [encryptData(accessToken), expiresAt, connectionId]);
 

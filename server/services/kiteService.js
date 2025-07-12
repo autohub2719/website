@@ -117,6 +117,12 @@ class KiteService {
         console.log('✅ User ID:', profile.user_id);
         console.log('✅ Email:', profile.email);
         console.log('✅ Broker:', profile.broker);
+        
+        // Update last successful connection time
+        await db.runAsync(
+          'UPDATE broker_connections SET last_sync = CURRENT_TIMESTAMP, is_authenticated = 1 WHERE id = ?',
+          [brokerConnection.id]
+        );
       } catch (testError) {
         console.error('❌ Connection test failed:', testError);
         console.error('❌ Error details:', {
@@ -125,7 +131,23 @@ class KiteService {
           error_type: testError.error_type,
           data: testError.data
         });
-        throw new Error(`Invalid credentials: ${testError.message}`);
+        
+        // Update authentication status in database
+        await db.runAsync(
+          'UPDATE broker_connections SET is_authenticated = 0 WHERE id = ?',
+          [brokerConnection.id]
+        );
+        
+        // Provide more specific error messages
+        if (testError.status === 403 || testError.error_type === 'TokenException') {
+          throw new Error('Invalid or expired access token. Please reconnect your account.');
+        } else if (testError.status === 400 || testError.error_type === 'InputException') {
+          throw new Error('Invalid API credentials. Please check your API key and secret.');
+        } else if (testError.status === 429) {
+          throw new Error('Rate limit exceeded. Please try again after some time.');
+        } else {
+          throw new Error(`Connection failed: ${testError.message || 'Unknown error'}`);
+        }
       }
 
       this.kiteInstances.set(brokerConnection.id, kc);
@@ -307,6 +329,16 @@ class KiteService {
       logger.error('Failed to get orders:', error);
       throw new Error(`Failed to get orders: ${error.message}`);
     }
+  }
+
+  // Clear cached KiteConnect instance (useful after token refresh/update)
+  clearCachedInstance(brokerConnectionId) {
+    if (this.kiteInstances.has(brokerConnectionId)) {
+      this.kiteInstances.delete(brokerConnectionId);
+      console.log(`🗑️ Cleared cached KiteConnect instance for connection ${brokerConnectionId}`);
+      return true;
+    }
+    return false;
   }
 
   // Get order status with enhanced error handling and retry logic

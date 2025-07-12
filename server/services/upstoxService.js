@@ -69,6 +69,59 @@ class UpstoxService {
     }
   }
 
+  // Refresh access token using refresh token
+  async refreshAccessToken(brokerConnectionId) {
+    try {
+      logger.info(`Refreshing Upstox access token for connection ${brokerConnectionId}`);
+      
+      const connection = await db.getAsync(
+        'SELECT * FROM broker_connections WHERE id = ? AND is_active = 1',
+        [brokerConnectionId]
+      );
+
+      if (!connection || !connection.refresh_token) {
+        throw new Error('Connection not found or refresh token not available');
+      }
+
+      const apiKey = decryptData(connection.api_key);
+      const apiSecret = decryptData(connection.encrypted_api_secret);
+      const refreshToken = decryptData(connection.refresh_token);
+
+      const tokenUrl = `${this.baseURL}/login/authorization/token`;
+      
+      const formData = new URLSearchParams({
+        refresh_token: refreshToken,
+        client_id: apiKey,
+        client_secret: apiSecret,
+        grant_type: 'refresh_token'
+      });
+
+      const response = await axios.post(tokenUrl, formData.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json'
+        },
+        timeout: 30000
+      });
+
+      if (response.data && response.data.access_token) {
+        logger.info('Upstox access token refreshed successfully');
+        return response.data;
+      } else {
+        throw new Error('Invalid refresh response');
+      }
+
+    } catch (error) {
+      logger.error('Failed to refresh Upstox access token:', error);
+      
+      const errorMessage = error.response?.data?.message || 
+                          error.response?.data?.error || 
+                          error.message;
+      
+      throw new Error(`Token refresh failed: ${errorMessage}`);
+    }
+  }
+
   // Initialize Upstox instance for a connection
   async initializeUpstox(brokerConnection) {
     try {
