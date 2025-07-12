@@ -16,6 +16,7 @@ interface BrokerConnectionForm {
   apiSecret: string;
   userId: string;
   connectionName: string;
+  redirectUri?: string;
 }
 
 interface BrokerConnection {
@@ -205,6 +206,8 @@ const BrokerConnection: React.FC = () => {
     setValue('apiSecret', '');
     setValue('userId', '');
     setValue('connectionName', '');
+    // Set default redirect URI for Upstox
+    setValue('redirectUri', brokerId === 'upstox' ? 'http://localhost:3001/api/broker/auth/upstox/callback' : '');
     setShowConnectionForm(true);
   };
 
@@ -219,6 +222,7 @@ const BrokerConnection: React.FC = () => {
       setValue('apiSecret', '');
       setValue('userId', connectionDetails.user_id_broker || '');
       setValue('connectionName', connection.connection_name || '');
+      setValue('redirectUri', connection.broker_name === 'upstox' ? 'http://localhost:3001/api/broker/auth/upstox/callback' : '');
       setShowEditForm(true);
     } catch (error: any) {
       console.error('Failed to fetch connection details:', error);
@@ -1006,6 +1010,30 @@ const BrokerConnection: React.FC = () => {
                       )}
                     </div>
 
+                    {/* Redirect URI field - only for Upstox */}
+                    {selectedBroker === 'upstox' && (
+                      <div>
+                        <label className="block text-sm font-medium text-bronze-700 mb-2">
+                          Redirect URI
+                        </label>
+                        <input
+                          {...register('redirectUri', { 
+                            required: selectedBroker === 'upstox' ? 'Redirect URI is required for Upstox' : false 
+                          })}
+                          type="url"
+                          className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                          placeholder="http://localhost:3001/api/broker/auth/upstox/callback"
+                          defaultValue="http://localhost:3001/api/broker/auth/upstox/callback"
+                        />
+                        {errors.redirectUri && (
+                          <p className="mt-1 text-sm text-red-600">{errors.redirectUri.message}</p>
+                        )}
+                        <p className="mt-1 text-xs text-bronze-500">
+                          This should match the redirect URI registered in your Upstox App settings
+                        </p>
+                      </div>
+                    )}
+
                     <div>
                       <label className="block text-sm font-medium text-bronze-700 mb-2">
                         User ID
@@ -1144,6 +1172,29 @@ const BrokerConnection: React.FC = () => {
                     </button>
                   </div>
                 </div>
+
+                {/* Redirect URI field - only for Upstox */}
+                {editingConnection?.broker_name === 'upstox' && (
+                  <div>
+                    <label className="block text-sm font-medium text-bronze-700 mb-2">
+                      Redirect URI
+                    </label>
+                    <input
+                      {...register('redirectUri', { 
+                        required: editingConnection?.broker_name === 'upstox' ? 'Redirect URI is required for Upstox' : false 
+                      })}
+                      type="url"
+                      className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                      placeholder="http://localhost:3001/api/broker/auth/upstox/callback"
+                    />
+                    {errors.redirectUri && (
+                      <p className="mt-1 text-sm text-red-600">{errors.redirectUri.message}</p>
+                    )}
+                    <p className="mt-1 text-xs text-bronze-500">
+                      This should match the redirect URI registered in your Upstox App settings
+                    </p>
+                  </div>
+                )}
 
                 <div>
                   <label className="block text-sm font-medium text-bronze-700 mb-2">
