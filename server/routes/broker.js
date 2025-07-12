@@ -7,6 +7,7 @@ import kiteService from '../services/kiteService.js';
 import upstoxService from '../services/upstoxService.js';
 import angelService from '../services/angelService.js';
 import shoonyaService from '../services/shoonyaService.js';
+import brokerConfigService from '../services/brokerConfigService.js';
 import createLogger from '../utils/logger.js';
 
 const logger = createLogger('BrokerHandler');
@@ -337,12 +338,51 @@ router.get('/holdings/:connectionId', authenticateToken, async (req, res) => {
 // Connect broker - Step 1: Store credentials and generate login URL
 router.post('/connect', authenticateToken, async (req, res) => {
   try {
-    const { brokerName, apiKey, apiSecret, userId, connectionName } = req.body;
+    const { 
+      brokerName, 
+      apiKey, 
+      apiSecret, 
+      clientCode,
+      password,
+      pin,
+      twoFA,
+      userId, 
+      connectionName,
+      vendorCode,
+      imei,
+      redirectUri,
+      appKey
+    } = req.body;
+
+    // Get broker configuration
+    const brokerConfig = brokerConfigService.getBrokerConfig(brokerName);
+    
+    // Validate required fields
+    const validation = brokerConfigService.validateBrokerData(brokerName, {
+      api_key: apiKey,
+      api_secret: apiSecret,
+      client_code: clientCode,
+      password: password,
+      pin: pin,
+      two_fa: twoFA,
+      user_id_broker: userId,
+      vendor_code: vendorCode,
+      imei: imei,
+      redirect_uri: redirectUri,
+      app_key: appKey
+    });
+
+    if (!validation.isValid) {
+      return res.status(400).json({ 
+        error: 'Validation failed', 
+        details: validation.errors 
+      });
+    }
 
     logger.info('Broker connection request:', { brokerName, userId, connectionName });
 
-    if (!brokerName || !apiKey || !apiSecret) {
-      return res.status(400).json({ error: 'Broker name, API key, and API secret are required' });
+    if (!brokerName || !apiKey) {
+      return res.status(400).json({ error: 'Broker name and API key are required' });
     }
 
     // Check connection limit (max 5 per user)
@@ -357,8 +397,7 @@ router.post('/connect', authenticateToken, async (req, res) => {
 
     // Generate unique webhook URL for this connection
     const webhookId = uuidv4();
-    const baseUrl = `${req.protocol}://${req.get('host')}`;
-    const webhookUrl = `${baseUrl}/api/webhook/${req.user.id}/${webhookId}`;
+    const webhookUrl = brokerConfigService.getWebhookUrl(req.user.id, webhookId);
 
     logger.info('Generated webhook URL:', webhookUrl);
 
@@ -376,14 +415,48 @@ router.post('/connect', authenticateToken, async (req, res) => {
       }
 
       const encryptedApiKey = encryptData(apiKey);
-      const encryptedApiSecret = encryptData(apiSecret);
+      const encryptedApiSecret = apiSecret ? encryptData(apiSecret) : null;
+      const encryptedClientCode = clientCode ? encryptData(clientCode) : null;
+      const encryptedPassword = password ? encryptData(password) : null;
+      const encryptedPin = pin ? encryptData(pin) : null;
+      const encryptedTwoFA = twoFA ? encryptData(twoFA) : null;
+
+      // Prepare broker-specific data
+      const brokerSpecificData = {
+        vendor_code: vendorCode,
+        imei: imei,
+        redirect_uri: redirectUri,
+        app_key: appKey,
+        auth_method: brokerConfig.authMethod
+      };
 
       // Create new connection
       const result = await db.runAsync(`
-        INSERT INTO broker_connections 
-        (user_id, broker_name, connection_name, api_key, api_secret, user_id_broker, webhook_url) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `, [req.user.id, brokerName.toLowerCase(), finalConnectionName, encryptedApiKey, encryptedApiSecret, userId, webhookUrl]);
+        INSERT INTO broker_connections (
+          user_id, broker_name, connection_name, api_key, encrypted_api_secret,
+          encrypted_client_code, encrypted_password, encrypted_pin, encrypted_two_fa,
+          user_id_broker, vendor_code, imei, redirect_uri, app_key,
+          auth_method, broker_specific_data, webhook_url, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `, [
+        req.user.id,
+        brokerName,
+        finalConnectionName,
+        encryptedApiKey,
+        encryptedApiSecret,
+        encryptedClientCode,
+        encryptedPassword,
+        encryptedPin,
+        encryptedTwoFA,
+        userId,
+        vendorCode,
+        imei,
+        redirectUri,
+        appKey,
+        brokerConfig.authMethod,
+        JSON.stringify(brokerSpecificData),
+        webhookUrl
+      ]);
       
       connectionId = result.lastID;
       logger.info('Created new broker connection:', connectionId);
@@ -392,82 +465,41 @@ router.post('/connect', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to encrypt credentials. Please try again.' });
     }
 
-    // For Zerodha, generate login URL with proper redirect URL
-    if (brokerName.toLowerCase() === 'zerodha') {
-      try {
-        const redirectUrl = `${baseUrl}/api/broker/auth/zerodha/callback`;
-        const state = JSON.stringify({ connection_id: connectionId });
-        
-        // Generate Zerodha login URL
-        const loginUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
-        
-        logger.info('Generated Zerodha login URL for connection:', connectionId);
-        
-        res.json({ 
-          message: 'Broker credentials stored. Please complete authentication.',
-          connectionId,
-          loginUrl,
-          webhookUrl,
-          requiresAuth: true,
-          redirectUrl,
-          connectionName: finalConnectionName
-        });
-      } catch (error) {
-        logger.error('Failed to generate login URL:', error);
-        res.status(400).json({ error: 'Invalid API key or failed to generate login URL' });
+    // Handle different broker authentication flows based on auth method
+    if (brokerConfig.authMethod === 'oauth') {
+      // Generate OAuth URL for Zerodha
+      let authUrl;
+      
+      if (brokerName.toLowerCase() === 'zerodha') {
+        authUrl = `https://kite.trade/connect/login?api_key=${apiKey}&v=3`;
+      } else if (brokerName.toLowerCase() === 'upstox') {
+        authUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+      } else if (brokerName.toLowerCase() === '5paisa') {
+        authUrl = `https://dev-openapi.5paisa.com/WebVendorLogin/VLogin/Index?VendorKey=${apiKey}&ResponseURL=${encodeURIComponent(redirectUri)}`;
       }
-    } else if (brokerName.toLowerCase() === 'upstox') {
-      try {
-        const redirectUrl = `${baseUrl}/api/broker/auth/upstox/callback`;
-        const state = JSON.stringify({ connection_id: connectionId });
-        
-        // Generate Upstox login URL
-        const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
-        
-        logger.info('Generated Upstox login URL for connection:', connectionId);
-        
-        res.json({ 
-          message: 'Broker credentials stored. Please complete authentication.',
-          connectionId,
-          loginUrl,
-          webhookUrl,
-          requiresAuth: true,
-          redirectUrl,
-          connectionName: finalConnectionName
-        });
-      } catch (error) {
-        logger.error('Failed to generate Upstox login URL:', error);
-        res.status(400).json({ error: 'Invalid API key or failed to generate login URL' });
-      }
-    } else if (brokerName.toLowerCase() === 'angel') {
-      // For Angel Broking, we need additional credentials (client code, password, TOTP)
-      res.json({ 
-        message: 'Angel Broking credentials stored. Additional authentication required.',
+      
+      res.json({
+        success: true,
+        message: 'Broker connection created. Please complete authentication.',
+        connectionId,
+        loginUrl: authUrl,
+        webhookUrl,
+        requiresAuth: true
+      });
+    } else if (brokerConfig.authMethod === 'manual') {
+      // For manual authentication brokers (Angel, Shoonya)
+      await db.runAsync(
+        'UPDATE broker_connections SET is_authenticated = 0 WHERE id = ?',
+        [connectionId]
+      );
+      
+      res.json({
+        success: true,
+        message: 'Broker connection created. Manual authentication required.',
         connectionId,
         webhookUrl,
         requiresAuth: true,
-        authType: 'credentials', // Indicates manual credential entry
-        connectionName: finalConnectionName
-      });
-    } else if (brokerName.toLowerCase() === 'shoonya') {
-      // For Shoonya, we need additional credentials (user ID, password, 2FA, vendor code, API secret)
-      res.json({ 
-        message: 'Shoonya credentials stored. Additional authentication required.',
-        connectionId,
-        webhookUrl,
-        requiresAuth: true,
-        authType: 'credentials', // Indicates manual credential entry
-        connectionName: finalConnectionName
-      });
-    } else {
-      // For other brokers, mark as connected (mock implementation)
-      logger.info('Connected to broker:', brokerName);
-      res.json({ 
-        message: 'Broker connected successfully',
-        connectionId,
-        webhookUrl,
-        requiresAuth: false,
-        connectionName: finalConnectionName
+        authMethod: 'manual'
       });
     }
   } catch (error) {
