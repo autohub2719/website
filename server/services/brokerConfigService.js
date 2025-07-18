@@ -47,8 +47,8 @@ class BrokerConfigService {
       shoonya: {
         name: 'Shoonya',
         authMethod: 'manual',
-        requiredFields: ['api_key', 'user_id_broker', 'password', 'vendor_code', 'imei'],
-        optionalFields: ['two_fa'],
+        requiredFields: ['api_key', 'user_id_broker', 'vendor_code', 'imei'],
+        optionalFields: ['api_secret'],
         authUrl: null,
         baseUrl: 'https://api.shoonya.com',
         webhookFormat: 'shoonya',
@@ -108,12 +108,22 @@ class BrokerConfigService {
     return config.webhookFormat;
   }
 
-  validateBrokerData(brokerName, data) {
+  validateBrokerData(brokerName, data, isInitialConnection = false) {
     const config = this.getBrokerConfig(brokerName);
     const errors = [];
 
+    // For manual auth brokers (Angel, Shoonya), password and two_fa are collected in the second step
+    let fieldsToValidate = config.requiredFields;
+    
+    if (isInitialConnection && config.authMethod === 'manual') {
+      // For initial connection, don't validate password and two_fa for manual auth brokers
+      fieldsToValidate = config.requiredFields.filter(field => 
+        !['password', 'two_fa', 'pin'].includes(field)
+      );
+    }
+
     // Check required fields
-    for (const field of config.requiredFields) {
+    for (const field of fieldsToValidate) {
       if (!data[field] || data[field].trim() === '') {
         errors.push(`${field} is required for ${config.name}`);
       }
@@ -210,7 +220,7 @@ class BrokerConfigService {
   }
 
   getWebhookUrl(userId, connectionId) {
-    const baseUrl = process.env.WEBHOOK_BASE_URL || 'https://your-domain.com';
+    const baseUrl = process.env.WEBHOOK_BASE_URL || 'http://localhost:3001';
     return `${baseUrl}/api/webhook/${userId}/${connectionId}`;
   }
 }

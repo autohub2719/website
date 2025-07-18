@@ -4,7 +4,7 @@ import { db } from '../database/init.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { encryptData, decryptData, testEncryption } from '../utils/encryption.js';
 import kiteService from '../services/kiteService.js';
-import upstoxService from '../services/upstoxService.js';
+import upstoxService, { checkUpstoxApiStatus } from '../services/upstoxService.js';
 import angelService from '../services/angelService.js';
 import shoonyaService from '../services/shoonyaService.js';
 import brokerConfigService from '../services/brokerConfigService.js';
@@ -244,7 +244,7 @@ router.get('/connections/:id', authenticateToken, async (req, res) => {
     const connection = await db.getAsync(`
       SELECT 
         id, broker_name, connection_name, is_active, created_at, last_sync, webhook_url,
-        user_id_broker, access_token_expires_at,
+        user_id_broker, vendor_code, imei, api_key, access_token_expires_at,
         CASE WHEN access_token IS NOT NULL AND access_token != '' THEN 1 ELSE 0 END as is_authenticated
       FROM broker_connections 
       WHERE id = ? AND user_id = ?
@@ -257,6 +257,16 @@ router.get('/connections/:id', authenticateToken, async (req, res) => {
     const now = Math.floor(Date.now() / 1000);
     connection.token_expired = connection.access_token_expires_at && connection.access_token_expires_at < now;
     connection.needs_token_refresh = connection.access_token_expires_at && (connection.access_token_expires_at - now) < 3600;
+
+    // For Shoonya connections, decrypt the API key for display
+    if (connection.broker_name.toLowerCase() === 'shoonya' && connection.api_key) {
+      try {
+        connection.api_key = decryptData(connection.api_key);
+      } catch (decryptError) {
+        logger.warn('Failed to decrypt API key for connection details:', decryptError);
+        connection.api_key = null;
+      }
+    }
 
     res.json({ connection });
   } catch (error) {
@@ -347,6 +357,51 @@ router.get('/positions/:connectionId', authenticateToken, async (req, res) => {
               unrealised: pos.unrealised_pnl || 0,
               realised: pos.realised_pnl || 0,
               value: (pos.quantity || 0) * (pos.last_price || 0)
+            }));
+        }
+      } else if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const positionsData = await shoonyaService.getPositions(connectionId);
+        
+        // Format Shoonya positions data
+        if (positionsData && positionsData.positions && Array.isArray(positionsData.positions)) {
+          positions = positionsData.positions
+            .filter(pos => Math.abs(pos.netqty || 0) > 0) // Only non-zero positions
+            .map(pos => ({
+              tradingsymbol: pos.tsym,
+              exchange: pos.exch,
+              instrument_token: pos.token,
+              product: pos.prd,
+              quantity: parseInt(pos.netqty || 0),
+              average_price: parseFloat(pos.netavgprc || 0),
+              last_price: parseFloat(pos.lp || 0),
+              pnl: parseFloat(pos.rpnl || 0) + parseFloat(pos.urmtom || 0),
+              unrealised: parseFloat(pos.urmtom || 0),
+              realised: parseFloat(pos.rpnl || 0),
+              value: parseFloat(pos.netqty || 0) * parseFloat(pos.lp || 0),
+              buy_quantity: parseInt(pos.daybuyqty || 0),
+              sell_quantity: parseInt(pos.daysellqty || 0),
+              multiplier: parseInt(pos.mult || 1)
+            }));
+        }
+      } else if (connection.broker_name.toLowerCase() === 'angel') {
+        const positionsData = await angelService.getPositions(connectionId);
+        
+        // Format Angel positions data
+        if (positionsData && positionsData.data && Array.isArray(positionsData.data)) {
+          positions = positionsData.data
+            .filter(pos => Math.abs(pos.netqty || 0) > 0) // Only non-zero positions
+            .map(pos => ({
+              tradingsymbol: pos.tradingsymbol,
+              exchange: pos.exchange,
+              instrument_token: pos.symboltoken,
+              product: pos.producttype,
+              quantity: parseInt(pos.netqty || 0),
+              average_price: parseFloat(pos.avgnetprice || 0),
+              last_price: parseFloat(pos.ltp || 0),
+              pnl: parseFloat(pos.pnl || 0),
+              unrealised: parseFloat(pos.unrealised || 0),
+              realised: parseFloat(pos.realised || 0),
+              value: parseFloat(pos.netvalue || 0)
             }));
         }
       } else {
@@ -468,6 +523,65 @@ router.get('/holdings/:connectionId', authenticateToken, async (req, res) => {
               collateral_quantity: holding.collateral_quantity || 0
             }));
         }
+      } else if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const holdingsData = await shoonyaService.getHoldings(connectionId);
+        
+        // Format Shoonya holdings data
+        if (holdingsData && holdingsData.holdings && Array.isArray(holdingsData.holdings)) {
+          holdings = holdingsData.holdings
+            .filter(holding => 
+              parseInt(holding.holdqty || 0) > 0 || 
+              parseInt(holding.npoadqty || 0) > 0 || 
+              parseInt(holding.benqty || 0) > 0
+            ) // Holdings with any positive quantity
+            .map(holding => {
+              // Get the first exchange info from exch_tsym array if available
+              const exchInfo = holding.exch_tsym && holding.exch_tsym[0] ? holding.exch_tsym[0] : {};
+              
+              return {
+                tradingsymbol: exchInfo.tsym || holding.tsym,
+                exchange: exchInfo.exch || holding.exch,
+                instrument_token: exchInfo.token || holding.token,
+                isin: exchInfo.isin || holding.isin,
+              product: holding.prd,
+              price: parseFloat(holding.upldprc || 0),
+              quantity: parseInt(holding.npoadqty || holding.holdqty || 0),
+              used_quantity: parseInt(holding.usedqty || 0),
+              collateral_quantity: parseInt(holding.brkcolqty || 0),
+              average_price: parseFloat(holding.upldprc || 0),
+              last_price: parseFloat(holding.lp || 0),
+              close_price: parseFloat(holding.lp || 0),
+              pnl: (parseInt(holding.npoadqty || holding.holdqty || 0) * (parseFloat(holding.lp || 0) - parseFloat(holding.upldprc || 0))),
+                day_change: parseFloat(holding.lp || 0) - parseFloat(holding.upldprc || 0),
+                day_change_percentage: parseFloat(holding.upldprc || 0) > 0 ? 
+                  ((parseFloat(holding.lp || 0) - parseFloat(holding.upldprc || 0)) / parseFloat(holding.upldprc || 0)) * 100 : 0
+              };
+            });
+        }
+      } else if (connection.broker_name.toLowerCase() === 'angel') {
+        const holdingsData = await angelService.getHoldings(connectionId);
+        
+        // Format Angel holdings data
+        if (holdingsData && holdingsData.data && Array.isArray(holdingsData.data)) {
+          holdings = holdingsData.data
+            .filter(holding => parseInt(holding.quantity || 0) > 0) // Only positive holdings
+            .map(holding => ({
+              tradingsymbol: holding.tradingsymbol,
+              exchange: holding.exchange,
+              instrument_token: holding.symboltoken,
+              isin: holding.isin,
+              product: holding.producttype,
+              price: parseFloat(holding.price || 0),
+              quantity: parseInt(holding.quantity || 0),
+              average_price: parseFloat(holding.averageprice || 0),
+              last_price: parseFloat(holding.ltp || 0),
+              close_price: parseFloat(holding.close || 0),
+              pnl: parseFloat(holding.pnl || 0),
+              day_change: parseFloat(holding.ltp || 0) - parseFloat(holding.close || 0),
+              day_change_percentage: parseFloat(holding.close || 0) > 0 ? 
+                ((parseFloat(holding.ltp || 0) - parseFloat(holding.close || 0)) / parseFloat(holding.close || 0)) * 100 : 0
+            }));
+        }
       } else {
         // For other brokers, implement their specific holdings fetching
         logger.warn(`Real-time holdings not implemented for ${connection.broker_name}`);
@@ -569,8 +683,8 @@ router.get('/connect/:connectionId/auth-url', authenticateToken, async (req, res
       authUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
     } else if (connection.broker_name.toLowerCase() === 'upstox') {
       const apiKey = decryptData(connection.api_key);
-      const redirectUrl = connection.redirect_uri || `${baseUrl}/api/broker/auth/upstox/callback`;
-      authUrl = `https://api.upstox.com/v2/login/authorization/dialog?client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&response_type=code&state=${encodeURIComponent(state)}`;
+      const redirectUrl = connection.redirect_uri || `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`;
+      authUrl = `https://api.upstox.com/v2/login/authorization/dialog?client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
     } else {
       return res.status(400).json({ 
         error: `Authentication URL generation not supported for ${connection.broker_name}` 
@@ -612,7 +726,7 @@ router.post('/connect', authenticateToken, async (req, res) => {
     // Get broker configuration
     const brokerConfig = brokerConfigService.getBrokerConfig(brokerName);
     
-    // Validate required fields
+    // Validate required fields for initial connection
     const validation = brokerConfigService.validateBrokerData(brokerName, {
       api_key: apiKey,
       api_secret: apiSecret,
@@ -625,9 +739,14 @@ router.post('/connect', authenticateToken, async (req, res) => {
       imei: imei,
       redirect_uri: redirectUri,
       app_key: appKey
-    });
+    }, true); // Pass true for isInitialConnection
 
     if (!validation.isValid) {
+      logger.warn('Broker connection validation failed:', {
+        brokerName,
+        validationErrors: validation.errors,
+        submittedData: Object.keys(req.body)
+      });
       return res.status(400).json({ 
         error: 'Validation failed', 
         details: validation.errors 
@@ -763,13 +882,17 @@ router.post('/connect', authenticateToken, async (req, res) => {
         [connectionId]
       );
       
+      // For Shoonya, always require manual authentication in second step
+      // Data is already saved in DB above
+      
       res.json({
         success: true,
         message: 'Broker connection created. Manual authentication required.',
         connectionId,
         webhookUrl,
         requiresAuth: true,
-        authMethod: 'manual'
+        authMethod: 'manual',
+        authType: 'credentials'
       });
     }
   } catch (error) {
@@ -784,6 +907,7 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
     const { connectionId } = req.params;
     
     logger.info('Reconnecting using stored credentials for connection:', connectionId);
+    console.log('🔌 Reconnecting broker connection:', connectionId);
 
     // Get connection details with encrypted credentials
     const connection = await db.getAsync(
@@ -792,77 +916,181 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
     );
 
     if (!connection) {
-      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+      logger.warn('Broker connection not found for reconnection', { connectionId, userId: req.user.id });
+      return res.status(404).json({ error: 'Broker connection not found' });
     }
 
+    console.log('🔍 Found broker connection for reconnection:', {
+      id: connection.id,
+      broker_name: connection.broker_name,
+      is_active: connection.is_active,
+      is_authenticated: connection.is_authenticated,
+      has_api_key: !!connection.api_key,
+      has_api_secret: !!connection.encrypted_api_secret
+    });
+
+    // First, ensure the connection is marked as active
+    console.log('🔄 Marking connection as active...');
+    await db.runAsync(
+      'UPDATE broker_connections SET is_active = 1, last_sync = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+      [connectionId, req.user.id]
+    );
+
     // Check if we have the required credentials
-    if (!connection.api_key || !connection.api_secret) {
+    if (!connection.api_key) {
+      logger.warn('Missing API key for reconnection', { connectionId });
       return res.status(400).json({
-        error: 'Missing API credentials. Please update your connection settings.',
+        error: 'Missing API key. Please update your connection settings.',
+        needsCredentials: true
+      });
+    }
+
+    // For OAuth brokers, also check for API secret
+    if ((connection.broker_name.toLowerCase() === 'zerodha' || 
+         connection.broker_name.toLowerCase() === 'upstox') && 
+        !connection.encrypted_api_secret) {
+      logger.warn('Missing API secret for OAuth broker reconnection', { 
+        connectionId, 
+        broker: connection.broker_name 
+      });
+      return res.status(400).json({
+        error: 'Missing API secret. Please update your connection settings.',
         needsCredentials: true
       });
     }
 
     try {
       // Decrypt stored credentials
+      console.log('🔐 Decrypting stored credentials...');
       const apiKey = decryptData(connection.api_key);
-      const apiSecret = decryptData(connection.encrypted_api_secret);
+      let apiSecret = null;
+      
+      if (connection.encrypted_api_secret) {
+        apiSecret = decryptData(connection.encrypted_api_secret);
+      }
       
       logger.info('Using stored credentials to reconnect');
+
+      // Clear any cached instances for this connection
+      let cacheCleared = false;
+      try {
+        console.log('🗑️ Clearing any cached instances...');
+        if (connection.broker_name.toLowerCase() === 'zerodha' && kiteService.clearCachedInstance) {
+          cacheCleared = kiteService.clearCachedInstance(connectionId);
+          console.log('🗑️ Zerodha cache cleared:', cacheCleared);
+        } else if (connection.broker_name.toLowerCase() === 'upstox' && upstoxService.clearCachedInstance) {
+          cacheCleared = upstoxService.clearCachedInstance(connectionId);
+          console.log('🗑️ Upstox cache cleared:', cacheCleared);
+        } else if (connection.broker_name.toLowerCase() === 'angel' && angelService.clearCachedInstance) {
+          cacheCleared = angelService.clearCachedInstance(connectionId);
+          console.log('🗑️ Angel cache cleared:', cacheCleared);
+        } else if (connection.broker_name.toLowerCase() === 'shoonya' && shoonyaService.clearCachedInstance) {
+          cacheCleared = shoonyaService.clearCachedInstance(connectionId);
+          console.log('🗑️ Shoonya cache cleared:', cacheCleared);
+        }
+      } catch (clearError) {
+        logger.warn(`Error clearing cached instance: ${clearError.message}`);
+        console.error('❌ Error clearing cached instance:', clearError);
+        // Continue with reconnection even if clearing cache fails
+      }
+
+      // Ensure any existing tokens are cleared from the database
+      console.log('🔄 Clearing existing tokens from database...');
+      await db.runAsync(
+        `UPDATE broker_connections 
+         SET access_token = NULL, 
+             refresh_token = NULL, 
+             feed_token = NULL,
+             session_token = NULL,
+             is_authenticated = 0
+         WHERE id = ?`,
+        [connectionId]
+      );
 
       const baseUrl = `${req.protocol}://${req.get('host')}`;
       const state = JSON.stringify({ 
         connection_id: connectionId,
+        user_id: req.user.id,
         reconnect: true 
       });
 
+      console.log('🔄 Generating authentication URL for broker:', connection.broker_name.toLowerCase());
+      
       if (connection.broker_name.toLowerCase() === 'zerodha') {
         const redirectUrl = `${baseUrl}/api/broker/auth/zerodha/callback`;
         const loginUrl = `https://kite.zerodha.com/connect/login?api_key=${apiKey}&v=3&redirect_url=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
 
         logger.info('Generated reconnection login URL for Zerodha connection:', connectionId);
+        console.log('✅ Generated Zerodha login URL');
 
         res.json({
           message: 'Please complete authentication to reconnect your Zerodha account.',
           loginUrl,
           requiresAuth: true,
           reconnect: true,
-          brokerName: 'Zerodha'
+          brokerName: 'Zerodha',
+          connectionId,
+          cacheCleared
         });
       } else if (connection.broker_name.toLowerCase() === 'upstox') {
-        const redirectUrl = `${baseUrl}/api/broker/auth/upstox/callback`;
+        const redirectUrl = connection.redirect_uri || `${baseUrl}/api/broker/auth/upstox/callback`;
         const loginUrl = `https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUrl)}&state=${encodeURIComponent(state)}`;
 
         logger.info('Generated reconnection login URL for Upstox connection:', connectionId);
+        console.log('✅ Generated Upstox login URL with redirect:', redirectUrl);
 
         res.json({
           message: 'Please complete authentication to reconnect your Upstox account.',
           loginUrl,
           requiresAuth: true,
           reconnect: true,
-          brokerName: 'Upstox'
+          brokerName: 'Upstox',
+          connectionId,
+          redirectUrl,
+          cacheCleared
         });
       } else if (connection.broker_name.toLowerCase() === 'angel') {
         logger.info('Angel Broking reconnection requires manual authentication');
+        console.log('✅ Angel Broking requires manual authentication');
 
         res.json({
           message: 'Please complete authentication to reconnect your Angel Broking account.',
           requiresAuth: true,
           authType: 'credentials',
           reconnect: true,
-          brokerName: 'Angel Broking'
+          brokerName: 'Angel Broking',
+          connectionId,
+          cacheCleared
         });
       } else if (connection.broker_name.toLowerCase() === 'shoonya') {
         logger.info('Shoonya reconnection requires manual authentication');
+        console.log('✅ Shoonya requires manual authentication');
+
+        // Extract stored credentials to simplify reconnection
+        const userId = connection.user_id_broker;
+        const vendorCode = connection.vendor_code;
+        const imei = connection.imei || '';
+        const storedApiKey = connection.api_key ? decryptData(connection.api_key) : '';
+        const apiSecret = connection.encrypted_api_secret ? decryptData(connection.encrypted_api_secret) : '';
 
         res.json({
           message: 'Please complete authentication to reconnect your Shoonya account.',
           requiresAuth: true,
           authType: 'credentials',
           reconnect: true,
-          brokerName: 'Shoonya'
+          brokerName: 'Shoonya',
+          connectionId,
+          cacheCleared,
+          // Include stored credentials to simplify the reconnection form
+          storedCredentials: {
+            user_id_broker: userId,
+            vendor_code: vendorCode,
+            api_key: storedApiKey,
+            imei: imei
+          }
         });
       } else {
+        logger.warn('Unsupported broker for reconnection', { broker: connection.broker_name });
         return res.status(400).json({
           error: 'Direct reconnection not supported for this broker. Please update your connection.',
           brokerName: connection.broker_name
@@ -871,6 +1099,7 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
 
     } catch (decryptError) {
       logger.error('Failed to decrypt stored credentials:', decryptError);
+      console.error('❌ Failed to decrypt stored credentials:', decryptError);
       return res.status(500).json({
         error: 'Failed to decrypt stored credentials. Please update your connection settings.',
         needsCredentials: true
@@ -879,7 +1108,8 @@ router.post('/reconnect/:connectionId', authenticateToken, async (req, res) => {
 
   } catch (error) {
     logger.error('Reconnect error:', error);
-    res.status(500).json({ error: 'Failed to reconnect. Please try again.' });
+    console.error('❌ Reconnect error:', error);
+    res.status(500).json({ error: `Failed to reconnect: ${error.message}` });
   }
 });
 
@@ -1057,10 +1287,35 @@ router.get('/auth/upstox/callback', async (req, res) => {
   try {
     const { code, state, error } = req.query;
 
-    logger.info('Upstox callback received:', { code: !!code, state, error });
+    // Enhanced logging for debugging
+    logger.info('Upstox callback received', { 
+      hasCode: !!code, 
+      codeLength: code ? code.length : 0,
+      state, 
+      error,
+      query: JSON.stringify(req.query),
+      headers: JSON.stringify(req.headers),
+      url: req.originalUrl,
+      fullUrl: `${req.protocol}://${req.get('host')}${req.originalUrl}`
+    });
+
+    // Log the raw request for debugging
+    console.log('📥 Upstox callback raw request:', {
+      url: req.originalUrl,
+      fullUrl: `${req.protocol}://${req.get('host')}${req.originalUrl}`,
+      query: req.query,
+      headers: {
+        host: req.get('host'),
+        referer: req.get('referer'),
+        origin: req.get('origin'),
+        'user-agent': req.get('user-agent')
+      }
+    });
 
     // Check if authentication was successful
     if (error || !code) {
+      logger.error('Upstox authentication failed', { error, hasCode: !!code });
+      
       return res.status(400).send(`
         <html>
           <head><title>Authentication Failed</title></head>
@@ -1068,6 +1323,11 @@ router.get('/auth/upstox/callback', async (req, res) => {
             <h1 style="color: #dc3545;">❌ Authentication Failed</h1>
             <p>Upstox authentication was not successful.</p>
             <p>Error: ${error || 'No authorization code received'}</p>
+            <p>Debug Info: ${JSON.stringify({ 
+              hasCode: !!code, 
+              url: req.originalUrl,
+              host: req.get('host')
+            })}</p>
             <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
           </body>
         </html>
@@ -1165,11 +1425,34 @@ router.get('/auth/upstox/callback', async (req, res) => {
       const apiKey = decryptData(connection.api_key);
       const apiSecret = decryptData(connection.encrypted_api_secret);
       
-      // Get redirect URI from the connection or construct it
-      const baseUrl = `${req.protocol}://${req.get('host')}`;
-      const redirectUri = connection.redirect_uri || `${baseUrl}/api/broker/auth/upstox/callback`;
+      // Get redirect URI from the connection or use the fixed HTTP version
+      // Using the exact URI registered in Upstox Developer account
+      const redirectUri = connection.redirect_uri || `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`;
       
-      logger.info('Generating access token for connection:', connectionId);
+      // Log detailed information about the redirect URI
+      logger.info('Redirect URI details', {
+        connectionId,
+        storedRedirectUri: connection.redirect_uri,
+        finalRedirectUri: redirectUri,
+        protocol: req.protocol,
+        host: req.get('host'),
+        headers: {
+          'x-forwarded-proto': req.get('x-forwarded-proto'),
+          'x-forwarded-host': req.get('x-forwarded-host')
+        }
+      });
+      
+      console.log('🔄 Redirect URI details:', {
+        storedInDB: connection.redirect_uri,
+        hardcoded: `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`,
+        final: redirectUri
+      });
+      
+      logger.info('Generating access token for connection', {
+        connectionId,
+        redirectUri,
+        codeLength: code ? code.length : 0
+      });
       
       // Generate access token using Upstox API
       const tokenResponse = await upstoxService.generateAccessToken(apiKey, apiSecret, code, redirectUri);
@@ -1189,13 +1472,33 @@ router.get('/auth/upstox/callback', async (req, res) => {
       const encryptedAccessToken = encryptData(accessToken);
       const encryptedRefreshToken = refreshToken ? encryptData(refreshToken) : null;
 
+      // Clear any cached instances for this connection
+      if (upstoxService.clearCachedInstance) {
+        upstoxService.clearCachedInstance(connectionId);
+      }
+
+      // Update the connection in the database
       await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, refresh_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
+        SET access_token = ?, 
+            refresh_token = ?, 
+            access_token_expires_at = ?, 
+            is_active = 1, 
+            is_authenticated = 1, 
+            last_sync = CURRENT_TIMESTAMP 
         WHERE id = ?
       `, [encryptedAccessToken, encryptedRefreshToken, expiresAt, connectionId]);
 
       logger.info('Upstox authentication completed for connection:', connectionId);
+      
+      // Log additional details for debugging
+      console.log('✅ Upstox authentication successful:', {
+        connectionId,
+        hasAccessToken: !!accessToken,
+        hasRefreshToken: !!refreshToken,
+        expiresAt: new Date(expiresAt * 1000).toISOString(),
+        reconnect: reconnect ? 'yes' : 'no'
+      });
 
       const actionText = reconnect ? 'Reconnection Successful' : 'Authentication Successful';
 
@@ -1400,14 +1703,37 @@ router.get('/auth/zerodha/callback', async (req, res) => {
       const expiresAt = Math.floor(tomorrow.getTime() / 1000);
 
       // Store access token
-      await db.runAsync(`
+      const encryptedAccessToken = encryptData(accessToken);
+      
+      // Update the connection in the database
+      const updateResult = await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
+        SET access_token = ?, 
+            access_token_expires_at = ?, 
+            is_active = 1, 
+            is_authenticated = 1, 
+            last_sync = CURRENT_TIMESTAMP 
         WHERE id = ?
-      `, [encryptData(accessToken), expiresAt, connectionId]);
+      `, [encryptedAccessToken, expiresAt, connectionId]);
+      
+      logger.info('Updated Zerodha connection in database', {
+        connectionId,
+        changes: updateResult.changes,
+        expiresAt: new Date(expiresAt * 1000).toISOString()
+      });
 
       // Clear any cached KiteConnect instances to force refresh
-      kiteService.clearCachedInstance(connectionId);
+      if (kiteService.clearCachedInstance) {
+        kiteService.clearCachedInstance(connectionId);
+      }
+      
+      // Log additional details for debugging
+      console.log('✅ Zerodha authentication successful:', {
+        connectionId,
+        hasAccessToken: !!accessToken,
+        expiresAt: new Date(expiresAt * 1000).toISOString(),
+        reconnect: reconnect ? 'yes' : 'no'
+      });
 
       logger.info('Zerodha authentication completed for connection:', connectionId);
 
@@ -1478,199 +1804,8 @@ router.get('/auth/zerodha/callback', async (req, res) => {
   }
 });
 
-// Upstox OAuth callback handler
-router.get('/auth/upstox/callback', async (req, res) => {
-  try {
-    const { code, state, error, error_description } = req.query;
-
-    logger.info('Upstox callback received:', { code, state, error, error_description });
-
-    // Check if authentication failed
-    if (error) {
-      return res.status(400).send(`
-        <html>
-          <head><title>Authentication Failed</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Authentication Failed</h1>
-            <p>Upstox authentication was not successful.</p>
-            <p>Error: ${error_description || error || 'Unknown error'}</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-    // Check if we have the authorization code
-    if (!code) {
-      return res.status(400).send(`
-        <html>
-          <head><title>Authentication Failed</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Authentication Failed</h1>
-            <p>Upstox authentication was not successful.</p>
-            <p>Error: No authorization code received</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-    // Parse the state parameter
-    let connectionId, reconnect;
-    try {
-      const stateObj = state ? JSON.parse(decodeURIComponent(state)) : {};
-      connectionId = stateObj.connection_id;
-      reconnect = stateObj.reconnect;
-    } catch (e) {
-      logger.error('Failed to parse state:', e);
-      return res.status(400).send(`
-        <html>
-          <head><title>Invalid State</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Invalid State Parameter</h1>
-            <p>Could not identify the connection. Please try again.</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-    if (!connectionId) {
-      return res.status(400).send(`
-        <html>
-          <head><title>Missing Connection ID</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Missing Connection ID</h1>
-            <p>Connection ID is required for authentication.</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-    // Get broker connection
-    const connection = await db.getAsync(
-      'SELECT * FROM broker_connections WHERE id = ?',
-      [connectionId]
-    );
-
-    if (!connection) {
-      return res.status(404).send(`
-        <html>
-          <head><title>Connection Not Found</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Connection Not Found</h1>
-            <p>Broker connection not found.</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-    try {
-      // Decrypt credentials
-      const apiKey = decryptData(connection.api_key);
-      const apiSecret = decryptData(connection.encrypted_api_secret);
-      const redirectUrl = `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`;
-      
-      logger.info('Generating access token for Upstox connection:', connectionId);
-      
-      // Generate access token using Upstox API
-      const accessTokenResponse = await upstoxService.generateAccessToken(apiKey, apiSecret, code, redirectUrl);
-      
-      if (!accessTokenResponse || !accessTokenResponse.access_token) {
-        throw new Error('Failed to generate access token');
-      }
-
-      const accessToken = accessTokenResponse.access_token;
-      
-      // Set token expiry (Upstox tokens typically expire in 24 hours)
-      const now = new Date();
-      const tomorrow = new Date(now);
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      const expiresAt = Math.floor(tomorrow.getTime() / 1000);
-
-      // Store access token
-      await db.runAsync(`
-        UPDATE broker_connections 
-        SET access_token = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, last_sync = CURRENT_TIMESTAMP 
-        WHERE id = ?
-      `, [encryptData(accessToken), expiresAt, connectionId]);
-
-      // Clear any cached Upstox instances to force refresh
-      upstoxService.clearCachedInstance(connectionId);
-
-      logger.info('Upstox authentication completed for connection:', connectionId);
-
-      const actionText = reconnect ? 'Reconnection Successful' : 'Authentication Successful';
-
-      // Return success page
-      res.send(`
-        <html>
-          <head>
-            <title>${actionText}</title>
-            <style>
-              body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f8f9fa; }
-              .success-container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 500px; margin: 0 auto; }
-              .success-icon { font-size: 48px; margin-bottom: 20px; }
-              .success-title { color: #28a745; margin-bottom: 15px; }
-              .success-message { color: #6c757d; margin-bottom: 30px; line-height: 1.6; }
-              .close-btn { padding: 12px 24px; background: #28a745; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
-              .close-btn:hover { background: #218838; }
-            </style>
-          </head>
-          <body>
-            <div class="success-container">
-              <div class="success-icon">✅</div>
-              <h1 class="success-title">${actionText}!</h1>
-              <p class="success-message">
-                Your Upstox account has been successfully ${reconnect ? 'reconnected' : 'connected'} to AutoTraderHub.<br>
-                Access token expires: ${new Date(expiresAt * 1000).toLocaleString()}<br>
-                You can now close this window and return to the dashboard.
-              </p>
-              <button class="close-btn" onclick="window.close()">Close Window</button>
-            </div>
-            <script>
-              // Auto-close after 5 seconds
-              setTimeout(() => {
-                window.close();
-              }, 5000);
-            </script>
-          </body>
-        </html>
-      `);
-
-    } catch (authError) {
-      logger.error('Upstox authentication error:', authError);
-      res.status(500).send(`
-        <html>
-          <head><title>Authentication Error</title></head>
-          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-            <h1 style="color: #dc3545;">❌ Authentication Error</h1>
-            <p>Failed to complete authentication: ${authError.message}</p>
-            <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-          </body>
-        </html>
-      `);
-    }
-
-  } catch (error) {
-    logger.error('Upstox callback handler error:', error);
-    res.status(500).send(`
-      <html>
-        <head><title>Server Error</title></head>
-        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-          <h1 style="color: #dc3545;">❌ Server Error</h1>
-          <p>An unexpected error occurred: ${error.message}</p>
-          <button onclick="window.close()" style="padding: 10px 20px; background: #6c757d; color: white; border: none; border-radius: 5px; cursor: pointer;">Close Window</button>
-        </body>
-      </html>
-    `);
-  }
-});
-
 // Angel Broking manual authentication endpoint
-router.post('/auth/angel/login', async (req, res) => {
+router.post('/auth/angel/login', authenticateToken, async (req, res) => {
   try {
     const { connectionId, clientCode, password, totp } = req.body;
 
@@ -1684,8 +1819,8 @@ router.post('/auth/angel/login', async (req, res) => {
 
     // Get broker connection
     const connection = await db.getAsync(
-      'SELECT * FROM broker_connections WHERE id = ?',
-      [connectionId]
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ?',
+      [connectionId, req.user.id]
     );
 
     if (!connection) {
@@ -1749,38 +1884,106 @@ router.post('/auth/angel/login', async (req, res) => {
   }
 });
 
-// Shoonya manual authentication endpoint
-router.post('/auth/shoonya/login', async (req, res) => {
+// Test Shoonya API credentials
+router.post('/auth/shoonya/test-credentials', authenticateToken, async (req, res) => {
   try {
-    const { connectionId, userId, password, twoFA, vendorCode, apiSecret, imei } = req.body;
+    const { userId, apiSecret, vendorCode } = req.body;
 
-    logger.info('Shoonya manual authentication:', { connectionId, userId });
-
-    if (!connectionId || !userId || !password || !vendorCode || !apiSecret) {
+    if (!userId || !apiSecret || !vendorCode) {
       return res.status(400).json({ 
-        error: 'Connection ID, user ID, password, vendor code, and API secret are required' 
+        error: 'User ID, API secret, and vendor code are required' 
       });
     }
 
-    // Get broker connection
+    logger.info('Testing Shoonya API credentials');
+    
+    const result = await shoonyaService.testApiCredentials(userId, apiSecret, vendorCode);
+    
+    return res.json({
+      success: true,
+      message: 'API credentials format is valid',
+      data: result
+    });
+  } catch (error) {
+    logger.error('Failed to test Shoonya API credentials:', error);
+    return res.status(500).json({ 
+      error: 'Failed to test API credentials', 
+      message: error.message 
+    });
+  }
+});
+
+// Shoonya manual authentication endpoint
+router.post('/auth/shoonya/login', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId, password, twoFA } = req.body;
+
+    logger.info('Shoonya manual authentication:', { 
+      connectionId, 
+      hasPassword: !!password,
+      hasTwoFA: !!twoFA
+    });
+
+    if (!connectionId || !password) {
+      return res.status(400).json({ 
+        error: 'Connection ID and password are required' 
+      });
+    }
+
+    // Get broker connection with all stored details
     const connection = await db.getAsync(
-      'SELECT * FROM broker_connections WHERE id = ?',
-      [connectionId]
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ?',
+      [connectionId, req.user.id]
     );
 
     if (!connection) {
       return res.status(404).json({ error: 'Broker connection not found' });
     }
 
+    // Extract all required parameters from the connection
+    const userId = connection.user_id_broker;
+    const vendorCode = connection.vendor_code;
+    const imei = connection.imei || '';
+    
+    // Validate required parameters
+    if (!userId || !vendorCode) {
+      return res.status(400).json({ 
+        error: 'Missing required parameters in broker connection. Please update your connection details.' 
+      });
+    }
+    
+    // Validate vendor code format
+    if (vendorCode.length < 2 || vendorCode.length > 10) {
+      logger.warn('Vendor code may be invalid:', { vendorCode, length: vendorCode.length });
+    }
+
     try {
-      // Decrypt credentials
-      const apiKey = decryptData(connection.api_key);
+      // Decrypt credentials if needed
+      let apiSecret;
       
-      logger.info('Generating session token for Shoonya connection:', connectionId);
+      // For Shoonya, use api_key as the API secret (Shoonya doesn't have separate API secret)
+      if (connection.api_key) {
+        apiSecret = decryptData(connection.api_key);
+        logger.debug('Using api_key as API secret for Shoonya authentication');
+      } else {
+        return res.status(400).json({ 
+          error: 'API key is missing from Shoonya broker connection. Please update your connection details.' 
+        });
+      }
+      
+      // Log connection details for debugging
+      logger.info('Generating session token for Shoonya connection:', {
+        connectionId,
+        userId,
+        vendorCode,
+        hasApiSecret: !!apiSecret,
+        apiSecretLength: apiSecret ? apiSecret.length : 0
+      });
       
       // Generate session token using Shoonya API
+      // Parameters: userId, password, twoFA, vendorCode, apiSecret, imei
       const sessionResponse = await shoonyaService.generateSessionToken(
-        apiKey, userId, password, twoFA, vendorCode, apiSecret, imei
+        userId, password, twoFA, vendorCode, apiSecret, imei
       );
       
       if (!sessionResponse || !sessionResponse.session_token) {
@@ -1798,7 +2001,7 @@ router.post('/auth/shoonya/login', async (req, res) => {
       // Store session token and user ID
       await db.runAsync(`
         UPDATE broker_connections 
-        SET access_token = ?, user_id_broker = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1, updated_at = CURRENT_TIMESTAMP 
+        SET access_token = ?, user_id_broker = ?, access_token_expires_at = ?, is_active = 1, is_authenticated = 1
         WHERE id = ?
       `, [encryptData(sessionToken), userId, expiresAt, connectionId]);
 
@@ -1816,9 +2019,26 @@ router.post('/auth/shoonya/login', async (req, res) => {
 
     } catch (authError) {
       logger.error('Shoonya authentication error:', authError);
-      res.status(500).json({
-        error: 'Authentication failed',
-        message: authError.message
+      
+      // Provide more specific error messages based on the error
+      let statusCode = 500;
+      let errorMessage = 'Authentication failed';
+      
+      if (authError.message.includes('Invalid Vendor code')) {
+        statusCode = 400;
+        errorMessage = 'Invalid vendor code. Please check your vendor code and try again.';
+      } else if (authError.message.includes('Invalid App Key')) {
+        statusCode = 400;
+        errorMessage = 'Invalid API secret or user ID. Please check your credentials and try again.';
+      } else if (authError.message.includes('Invalid Input')) {
+        statusCode = 400;
+        errorMessage = 'Invalid input parameters. Please check all your credentials and try again.';
+      }
+      
+      res.status(statusCode).json({
+        error: errorMessage,
+        message: authError.message,
+        details: 'Please use the test-credentials endpoint to validate your API credentials format.'
       });
     }
 
@@ -1835,16 +2055,109 @@ router.post('/auth/shoonya/login', async (req, res) => {
 router.post('/disconnect', authenticateToken, async (req, res) => {
   try {
     const { connectionId } = req.body;
+    
+    if (!connectionId) {
+      return res.status(400).json({ error: 'Connection ID is required' });
+    }
+    
+    logger.info('Disconnecting broker connection', { connectionId, userId: req.user.id });
+    console.log('🔌 Disconnecting broker connection:', connectionId);
 
-    await db.runAsync(
-      'UPDATE broker_connections SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?',
+    // Verify the connection exists and belongs to the user
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ?',
       [connectionId, req.user.id]
     );
 
-    res.json({ message: 'Broker disconnected successfully' });
+    if (!connection) {
+      logger.warn('Broker connection not found', { connectionId, userId: req.user.id });
+      return res.status(404).json({ error: 'Broker connection not found' });
+    }
+
+    console.log('🔍 Found broker connection:', {
+      id: connection.id,
+      broker_name: connection.broker_name,
+      is_active: connection.is_active,
+      is_authenticated: connection.is_authenticated
+    });
+
+    // Clear any cached instances for this connection
+    let cacheCleared = false;
+    try {
+      if (connection.broker_name.toLowerCase() === 'zerodha' && kiteService.clearCachedInstance) {
+        cacheCleared = kiteService.clearCachedInstance(connectionId);
+        console.log('🗑️ Zerodha cache cleared:', cacheCleared);
+      } else if (connection.broker_name.toLowerCase() === 'upstox' && upstoxService.clearCachedInstance) {
+        cacheCleared = upstoxService.clearCachedInstance(connectionId);
+        console.log('🗑️ Upstox cache cleared:', cacheCleared);
+      } else if (connection.broker_name.toLowerCase() === 'angel' && angelService.clearCachedInstance) {
+        cacheCleared = angelService.clearCachedInstance(connectionId);
+        console.log('🗑️ Angel cache cleared:', cacheCleared);
+      } else if (connection.broker_name.toLowerCase() === 'shoonya' && shoonyaService.clearCachedInstance) {
+        cacheCleared = shoonyaService.clearCachedInstance(connectionId);
+        console.log('🗑️ Shoonya cache cleared:', cacheCleared);
+      }
+    } catch (clearError) {
+      logger.warn(`Error clearing cached instance: ${clearError.message}`);
+      console.error('❌ Error clearing cached instance:', clearError);
+      // Continue with disconnection even if clearing cache fails
+    }
+
+    // Update the connection status in the database - use explicit NULL values
+    console.log('🔄 Updating database to disconnect broker...');
+    const result = await db.runAsync(
+      `UPDATE broker_connections 
+       SET is_active = 0, 
+           is_authenticated = 0, 
+           access_token = NULL, 
+           refresh_token = NULL, 
+           feed_token = NULL,
+           session_token = NULL,
+           last_sync = CURRENT_TIMESTAMP 
+       WHERE id = ? AND user_id = ?`,
+      [connectionId, req.user.id]
+    );
+    
+    console.log('🔄 Database update result:', {
+      changes: result.changes,
+      lastID: result.lastID
+    });
+    
+    if (result.changes === 0) {
+      logger.warn(`No changes made when disconnecting broker ${connectionId}`);
+      return res.status(400).json({ error: 'Failed to disconnect broker. No changes were made.' });
+    }
+    
+    // Verify the connection was actually updated
+    const verifyConnection = await db.getAsync(
+      'SELECT is_active, is_authenticated, access_token, refresh_token FROM broker_connections WHERE id = ?',
+      [connectionId]
+    );
+    
+    console.log('✅ Verification after disconnect:', {
+      is_active: verifyConnection.is_active,
+      is_authenticated: verifyConnection.is_authenticated,
+      has_access_token: !!verifyConnection.access_token,
+      has_refresh_token: !!verifyConnection.refresh_token
+    });
+    
+    logger.info('Broker disconnected successfully', { 
+      connectionId, 
+      userId: req.user.id,
+      changes: result.changes,
+      cacheCleared
+    });
+
+    res.json({ 
+      message: 'Broker disconnected successfully',
+      success: true,
+      connectionId,
+      cacheCleared
+    });
   } catch (error) {
     logger.error('Disconnect broker error:', error);
-    res.status(500).json({ error: 'Failed to disconnect broker' });
+    console.error('❌ Disconnect broker error:', error);
+    res.status(500).json({ error: `Failed to disconnect broker: ${error.message}` });
   }
 });
 
@@ -2004,6 +2317,744 @@ router.post('/test/:connectionId', authenticateToken, async (req, res) => {
   } catch (error) {
     logger.error('Test connection error:', error);
     res.status(500).json({ error: 'Broker connection test failed' });
+  }
+});
+
+// Check Upstox API status
+router.get('/debug/upstox-api-status', async (req, res) => {
+  try {
+    const apiStatus = await checkUpstoxApiStatus();
+    return res.json(apiStatus);
+  } catch (error) {
+    logger.error('Failed to check Upstox API status:', error);
+    return res.status(500).json({ 
+      status: 'error', 
+      message: 'Failed to check Upstox API status',
+      error: error.message
+    });
+  }
+});
+
+// Debug endpoint for Upstox authentication
+router.get('/debug/upstox-auth', async (req, res) => {
+  try {
+    const { connection_id } = req.query;
+    
+    if (!connection_id) {
+      return res.status(400).json({ error: 'Connection ID is required' });
+    }
+    
+    // Get broker connection
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ?',
+      [connection_id]
+    );
+    
+    if (!connection) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+    
+    // Get redirect URI - using the exact URI registered in Upstox Developer account
+    const redirectUri = connection.redirect_uri || `${req.protocol}://${req.get('host')}/api/broker/auth/upstox/callback`;
+    
+    // Decrypt API key (but don't expose the secret)
+    const apiKey = connection.api_key ? decryptData(connection.api_key) : null;
+    const maskedApiKey = apiKey ? `${apiKey.substring(0, 4)}...${apiKey.substring(apiKey.length - 4)}` : null;
+    
+    // Generate auth URL
+    const state = encodeURIComponent(JSON.stringify({
+      connection_id: connection.id,
+      user_id: connection.user_id,
+      debug: true
+    }));
+    
+    const authUrl = `https://api.upstox.com/v2/login/authorization/dialog?client_id=${apiKey}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&state=${state}`;
+    
+    // Return debug info
+    return res.json({
+      connection_id: connection.id,
+      broker_name: connection.broker_name,
+      connection_name: connection.connection_name,
+      is_authenticated: !!connection.access_token,
+      redirect_uri: redirectUri,
+      masked_api_key: maskedApiKey,
+      has_api_secret: !!connection.encrypted_api_secret,
+      auth_url: authUrl,
+      request_info: {
+        protocol: req.protocol,
+        host: req.get('host'),
+        original_url: req.originalUrl,
+        headers: {
+          'x-forwarded-proto': req.get('x-forwarded-proto'),
+          'x-forwarded-host': req.get('x-forwarded-host'),
+          'host': req.get('host'),
+          'origin': req.get('origin'),
+          'referer': req.get('referer')
+        }
+      }
+    });
+  } catch (error) {
+    logger.error('Debug endpoint error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Get orders from broker
+router.get('/orders/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    
+    logger.info(`Fetching orders for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let orders = [];
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'zerodha') {
+        const ordersData = await kiteService.getOrders(connectionId);
+        
+        if (ordersData && Array.isArray(ordersData)) {
+          orders = ordersData.map(order => ({
+            order_id: order.order_id,
+            exchange_order_id: order.exchange_order_id,
+            parent_order_id: order.parent_order_id,
+            status: order.status,
+            status_message: order.status_message,
+            order_timestamp: order.order_timestamp,
+            exchange_timestamp: order.exchange_timestamp,
+            variety: order.variety,
+            exchange: order.exchange,
+            tradingsymbol: order.tradingsymbol,
+            instrument_token: order.instrument_token,
+            order_type: order.order_type,
+            transaction_type: order.transaction_type,
+            validity: order.validity,
+            product: order.product,
+            quantity: order.quantity,
+            disclosed_quantity: order.disclosed_quantity,
+            price: order.price,
+            trigger_price: order.trigger_price,
+            average_price: order.average_price,
+            filled_quantity: order.filled_quantity,
+            pending_quantity: order.pending_quantity,
+            cancelled_quantity: order.cancelled_quantity
+          }));
+        }
+      } else if (connection.broker_name.toLowerCase() === 'upstox') {
+        const ordersData = await upstoxService.getOrders(connectionId);
+        
+        if (ordersData && Array.isArray(ordersData)) {
+          orders = ordersData.map(order => ({
+            order_id: order.order_id,
+            exchange_order_id: order.exchange_order_id,
+            status: order.status,
+            order_timestamp: order.order_timestamp,
+            exchange: order.exchange,
+            tradingsymbol: order.instrument_token,
+            instrument_token: order.instrument_token,
+            order_type: order.order_type,
+            transaction_type: order.transaction_type,
+            product: order.product,
+            quantity: order.quantity,
+            price: order.price,
+            trigger_price: order.trigger_price,
+            average_price: order.average_price,
+            filled_quantity: order.filled_quantity,
+            pending_quantity: order.pending_quantity
+          }));
+        }
+      } else if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const ordersData = await shoonyaService.getOrders(connectionId);
+        
+        if (ordersData && ordersData.orders && Array.isArray(ordersData.orders)) {
+          orders = ordersData.orders.map(order => ({
+            order_id: order.norenordno,
+            exchange_order_id: order.exordno,
+            status: order.status,
+            status_message: order.rejreason || '',
+            order_timestamp: order.norentm,
+            exchange_timestamp: order.exch_tm,
+            exchange: order.exch,
+            tradingsymbol: order.tsym,
+            instrument_token: order.token,
+            order_type: order.prctyp,
+            transaction_type: order.trantype,
+            validity: order.ret,
+            product: order.prd,
+            quantity: parseInt(order.qty || 0),
+            disclosed_quantity: parseInt(order.dscqty || 0),
+            price: parseFloat(order.prc || 0),
+            trigger_price: parseFloat(order.trgprc || 0),
+            average_price: parseFloat(order.avgprc || 0),
+            filled_quantity: parseInt(order.fillshares || 0),
+            pending_quantity: parseInt(order.qty || 0) - parseInt(order.fillshares || 0),
+            cancelled_quantity: 0
+          }));
+        }
+      } else if (connection.broker_name.toLowerCase() === 'angel') {
+        const ordersData = await angelService.getOrders(connectionId);
+        
+        if (ordersData && ordersData.data && Array.isArray(ordersData.data)) {
+          orders = ordersData.data.map(order => ({
+            order_id: order.orderid,
+            exchange_order_id: order.exchangeorderid,
+            status: order.status,
+            order_timestamp: order.ordertime,
+            exchange: order.exchange,
+            tradingsymbol: order.tradingsymbol,
+            instrument_token: order.symboltoken,
+            order_type: order.ordertype,
+            transaction_type: order.transactiontype,
+            product: order.producttype,
+            quantity: parseInt(order.quantity || 0),
+            price: parseFloat(order.price || 0),
+            trigger_price: parseFloat(order.triggerprice || 0),
+            average_price: parseFloat(order.averageprice || 0),
+            filled_quantity: parseInt(order.filledshares || 0),
+            pending_quantity: parseInt(order.unfilledshares || 0)
+          }));
+        }
+      } else {
+        logger.warn(`Orders not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Orders not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved ${orders.length} orders for connection ${connectionId}`);
+      
+      res.json({
+        orders,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch orders from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch orders from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch orders' });
+  }
+});
+
+// Get trade book from broker (Shoonya specific)
+router.get('/tradebook/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    
+    logger.info(`Fetching trade book for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let trades = [];
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const tradesData = await shoonyaService.getTradeBook(connectionId);
+        
+        if (tradesData && tradesData.trades && Array.isArray(tradesData.trades)) {
+          trades = tradesData.trades.map(trade => ({
+            trade_id: trade.norenordno,
+            order_id: trade.norenordno,
+            exchange_order_id: trade.exordno,
+            exchange: trade.exch,
+            tradingsymbol: trade.tsym,
+            instrument_token: trade.token,
+            product: trade.prd,
+            quantity: parseInt(trade.qty || 0),
+            price: parseFloat(trade.prc || 0),
+            transaction_type: trade.trantype,
+            trade_timestamp: trade.norentm,
+            exchange_timestamp: trade.exch_tm
+          }));
+        }
+      } else {
+        logger.warn(`Trade book not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Trade book not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved ${trades.length} trades for connection ${connectionId}`);
+      
+      res.json({
+        trades,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch trade book from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch trade book from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get trade book error:', error);
+    res.status(500).json({ error: 'Failed to fetch trade book' });
+  }
+});
+
+// Get limits/margins from broker
+router.get('/limits/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    const { product_type, segment, exchange } = req.query;
+    
+    logger.info(`Fetching limits for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let limits = {};
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const limitsData = await shoonyaService.getLimits(connectionId, product_type, segment, exchange);
+        
+        if (limitsData && limitsData.limits) {
+          limits = {
+            cash: parseFloat(limitsData.limits.cash || 0),
+            payin: parseFloat(limitsData.limits.payin || 0),
+            payout: parseFloat(limitsData.limits.payout || 0),
+            brkcollamt: parseFloat(limitsData.limits.brkcollamt || 0),
+            unclearedcash: parseFloat(limitsData.limits.unclearedcash || 0),
+            daycash: parseFloat(limitsData.limits.daycash || 0),
+            marginused: parseFloat(limitsData.limits.marginused || 0),
+            mtomcurper: parseFloat(limitsData.limits.mtomcurper || 0)
+          };
+        }
+      } else {
+        logger.warn(`Limits not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Limits not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved limits for connection ${connectionId}`);
+      
+      res.json({
+        limits,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch limits from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch limits from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get limits error:', error);
+    res.status(500).json({ error: 'Failed to fetch limits' });
+  }
+});
+
+// Get watchlist names (Shoonya specific)
+router.get('/watchlists/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    
+    logger.info(`Fetching watchlist names for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let watchlists = [];
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const watchlistsData = await shoonyaService.getWatchlistNames(connectionId);
+        
+        if (watchlistsData && watchlistsData.watchlists) {
+          watchlists = watchlistsData.watchlists;
+        }
+      } else {
+        logger.warn(`Watchlists not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Watchlists not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved ${watchlists.length} watchlists for connection ${connectionId}`);
+      
+      res.json({
+        watchlists,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch watchlists from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch watchlists from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get watchlists error:', error);
+    res.status(500).json({ error: 'Failed to fetch watchlists' });
+  }
+});
+
+// Get specific watchlist (Shoonya specific)
+router.get('/watchlist/:connectionId/:watchlistName', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId, watchlistName } = req.params;
+    
+    logger.info(`Fetching watchlist ${watchlistName} for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let watchlist = [];
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const watchlistData = await shoonyaService.getWatchlist(connectionId, watchlistName);
+        
+        if (watchlistData && watchlistData.watchlist) {
+          watchlist = watchlistData.watchlist;
+        }
+      } else {
+        logger.warn(`Watchlist not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Watchlist not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved watchlist ${watchlistName} with ${watchlist.length} items for connection ${connectionId}`);
+      
+      res.json({
+        watchlist_name: watchlistName,
+        watchlist,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch watchlist from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch watchlist from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get watchlist error:', error);
+    res.status(500).json({ error: 'Failed to fetch watchlist' });
+  }
+});
+
+// Search symbols (Shoonya specific)
+router.get('/search/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    const { symbol, exchange = 'NSE' } = req.query;
+    
+    if (!symbol) {
+      return res.status(400).json({ error: 'Symbol parameter is required' });
+    }
+    
+    logger.info(`Searching symbol ${symbol} on ${exchange} for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let searchResults = [];
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const searchData = await shoonyaService.searchSymbol(connectionId, symbol, exchange);
+        
+        if (searchData && Array.isArray(searchData)) {
+          searchResults = searchData.map(result => ({
+            exchange: result.exch,
+            token: result.token,
+            trading_symbol: result.tsym,
+            symbol: result.tsym,
+            company_name: result.cname,
+            instrument_type: result.instname,
+            lot_size: parseInt(result.ls || 1),
+            tick_size: parseFloat(result.ti || 0.05)
+          }));
+        }
+      } else {
+        logger.warn(`Symbol search not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Symbol search not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Found ${searchResults.length} results for symbol ${symbol} on ${exchange}`);
+      
+      res.json({
+        search_query: symbol,
+        exchange,
+        results: searchResults,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to search symbols from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to search symbols from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Search symbols error:', error);
+    res.status(500).json({ error: 'Failed to search symbols' });
+  }
+});
+
+// Get market data/quotes (Shoonya specific)
+router.get('/quotes/:connectionId', authenticateToken, async (req, res) => {
+  try {
+    const { connectionId } = req.params;
+    const { exchange, token } = req.query;
+    
+    if (!exchange || !token) {
+      return res.status(400).json({ error: 'Exchange and token parameters are required' });
+    }
+    
+    logger.info(`Fetching quotes for ${exchange}:${token} for connection ${connectionId}`);
+
+    // Verify connection belongs to user and is active
+    const connection = await db.getAsync(
+      'SELECT * FROM broker_connections WHERE id = ? AND user_id = ? AND is_active = 1',
+      [connectionId, req.user.id]
+    );
+
+    if (!connection) {
+      return res.status(404).json({ error: 'Broker connection not found or inactive' });
+    }
+
+    // Validate token and handle expiration
+    const tokenValidation = await validateTokenAndHandleExpiration(connection, res, logger);
+    if (!tokenValidation.valid) {
+      return tokenValidation.response;
+    }
+
+    let quotes = {};
+    
+    try {
+      if (connection.broker_name.toLowerCase() === 'shoonya') {
+        const quotesData = await shoonyaService.getMarketData(connectionId, exchange, token);
+        
+        if (quotesData && quotesData.stat === 'Ok') {
+          quotes = {
+            exchange: quotesData.exch,
+            token: quotesData.token,
+            trading_symbol: quotesData.tsym,
+            last_price: parseFloat(quotesData.lp || 0),
+            change: parseFloat(quotesData.c || 0),
+            change_percentage: parseFloat(quotesData.prcftr_d || 0),
+            volume: parseInt(quotesData.v || 0),
+            average_price: parseFloat(quotesData.ap || 0),
+            lower_circuit: parseFloat(quotesData.lc || 0),
+            upper_circuit: parseFloat(quotesData.uc || 0),
+            open: parseFloat(quotesData.o || 0),
+            high: parseFloat(quotesData.h || 0),
+            low: parseFloat(quotesData.l || 0),
+            close: parseFloat(quotesData.c || 0),
+            bid_price: parseFloat(quotesData.bp1 || 0),
+            bid_quantity: parseInt(quotesData.bq1 || 0),
+            ask_price: parseFloat(quotesData.sp1 || 0),
+            ask_quantity: parseInt(quotesData.sq1 || 0)
+          };
+        }
+      } else {
+        logger.warn(`Market data not implemented for ${connection.broker_name}`);
+        return res.status(400).json({ 
+          error: `Market data not supported for ${connection.broker_name}` 
+        });
+      }
+
+      logger.info(`Retrieved market data for ${exchange}:${token}`);
+      
+      res.json({
+        quotes,
+        broker_name: connection.broker_name,
+        last_updated: new Date().toISOString(),
+        connection_id: connectionId
+      });
+
+    } catch (brokerError) {
+      logger.error('Failed to fetch market data from broker:', brokerError);
+      
+      if (brokerError.message && (brokerError.message.includes('api_key') || brokerError.message.includes('access_token'))) {
+        return res.status(401).json({ 
+          error: 'Invalid or expired credentials. Please reconnect your account.',
+          tokenExpired: true,
+          details: brokerError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to fetch market data from broker',
+        details: brokerError.message
+      });
+    }
+
+  } catch (error) {
+    logger.error('Get market data error:', error);
+    res.status(500).json({ error: 'Failed to fetch market data' });
   }
 });
 

@@ -331,15 +331,7 @@ class KiteService {
     }
   }
 
-  // Clear cached KiteConnect instance (useful after token refresh/update)
-  clearCachedInstance(brokerConnectionId) {
-    if (this.kiteInstances.has(brokerConnectionId)) {
-      this.kiteInstances.delete(brokerConnectionId);
-      console.log(`🗑️ Cleared cached KiteConnect instance for connection ${brokerConnectionId}`);
-      return true;
-    }
-    return false;
-  }
+  // Clear cached instance method is implemented at the end of the class
 
   // Get order status with enhanced error handling and retry logic
   async getOrderStatus(brokerConnectionId, orderId) {

@@ -10,6 +10,33 @@ import {
 import { brokerAPI } from '../../services/api';
 import toast from 'react-hot-toast';
 
+
+
+// Place this above or outside your main component (or in a separate file if needed)
+const ConnectionButton = ({
+  onClick,
+  disabled = false,
+  hoverScale = 1.05,
+  tapScale = 0.95,
+  className = '',
+  icon: Icon,
+  iconAnimation = '',
+  children,
+}) => (
+  <motion.button
+    onClick={onClick}
+    disabled={disabled}
+    whileHover={{ scale: hoverScale }}
+    whileTap={{ scale: tapScale }}
+    className={`flex items-center justify-center space-x-1 text-sm py-2 px-3 rounded-lg transition-colors shadow-3d ${className} ${
+      disabled ? 'opacity-50' : ''
+    }`}
+  >
+    {Icon && <Icon className={`w-4 h-4 ${iconAnimation}`} />}
+    <span>{children}</span>
+  </motion.button>
+);
+
 interface BrokerConnectionForm {
   brokerName: string;
   apiKey: string;
@@ -17,6 +44,10 @@ interface BrokerConnectionForm {
   userId: string;
   connectionName: string;
   redirectUri?: string;
+  vendorCode?: string;
+  password?: string;
+  imei?: string;
+  twoFA?: string;
 }
 
 interface BrokerConnection {
@@ -52,7 +83,7 @@ const BrokerConnection: React.FC = () => {
   const [showAngelAuth, setShowAngelAuth] = useState(false);
   const [showShoonyaAuth, setShowShoonyaAuth] = useState(false);
   const [angelAuthData, setAngelAuthData] = useState<{connectionId: number} | null>(null);
-  const [shoonyaAuthData, setShoonyaAuthData] = useState<{connectionId: number} | null>(null);
+  const [shoonyaAuthData, setShoonyaAuthData] = useState<{connectionId: number, storedCredentials?: any} | null>(null);
   
   const { register, handleSubmit, watch, reset, setValue, formState: { errors } } = useForm<BrokerConnectionForm>();
   const selectedBroker = watch('brokerName');
@@ -134,7 +165,16 @@ const BrokerConnection: React.FC = () => {
           setAngelAuthData({ connectionId: response.data.connectionId });
           setShowAngelAuth(true);
         } else if (data.brokerName.toLowerCase() === 'shoonya') {
-          setShoonyaAuthData({ connectionId: response.data.connectionId });
+          // For new connections, pass the form data as stored credentials
+          setShoonyaAuthData({ 
+            connectionId: response.data.connectionId,
+            storedCredentials: {
+              user_id_broker: data.userId,
+              vendor_code: data.vendorCode,
+              imei: data.imei,
+              api_key: data.apiKey
+            }
+          });
           setShowShoonyaAuth(true);
         }
         toast.success('Credentials saved! Please complete authentication.');
@@ -150,11 +190,17 @@ const BrokerConnection: React.FC = () => {
       const errorMessage = error.response?.data?.error || 'Failed to connect broker';
       toast.error(errorMessage);
       
-      if (error.response?.data?.errors) {
-        const errors = error.response.data.errors;
-        Object.keys(errors).forEach(key => {
-          toast.error(`${key}: ${errors[key]}`);
-        });
+      if (error.response?.data?.details) {
+        const details = error.response.data.details;
+        if (Array.isArray(details)) {
+          details.forEach(detail => {
+            toast.error(detail);
+          });
+        } else {
+          Object.keys(details).forEach(key => {
+            toast.error(`${key}: ${details[key]}`);
+          });
+        }
       }
     } finally {
       setIsSubmitting(false);
@@ -178,11 +224,18 @@ const BrokerConnection: React.FC = () => {
         });
         toast.success('Credentials updated! Please complete authentication.');
       } else if (response.data.requiresAuth && response.data.authType === 'credentials') {
-        // For Angel Broking, show manual authentication form
-        setShowAngelAuth({
-          connectionId: response.data.connectionId,
-          brokerName: editingConnection.broker_name
-        });
+        // For Angel/Shoonya, show manual authentication form
+        if (editingConnection.broker_name.toLowerCase() === 'angel') {
+          setAngelAuthData({ connectionId: response.data.connectionId });
+          setShowAngelAuth(true);
+        } else if (editingConnection.broker_name.toLowerCase() === 'shoonya') {
+          // Use stored credentials from update response if available
+          setShoonyaAuthData({ 
+            connectionId: response.data.connectionId,
+            storedCredentials: response.data.storedCredentials || editingConnection
+          });
+          setShowShoonyaAuth(true);
+        }
         toast.success('Credentials updated! Please complete authentication.');
       } else {
         toast.success('Broker connection updated successfully!');
@@ -206,7 +259,7 @@ const BrokerConnection: React.FC = () => {
     setValue('apiSecret', '');
     setValue('userId', '');
     setValue('connectionName', '');
-    // Set default redirect URI for Upstox
+    // Set default redirect URI for Upstox - using HTTP for local development
     setValue('redirectUri', brokerId === 'upstox' ? 'http://localhost:3001/api/broker/auth/upstox/callback' : '');
     setShowConnectionForm(true);
   };
@@ -267,9 +320,15 @@ const BrokerConnection: React.FC = () => {
   const handleReconnectNow = async (connectionId: number) => {
     try {
       setReconnectingConnection(connectionId);
+      console.log('Attempting to reconnect broker connection:', connectionId);
+      
       const response = await brokerAPI.reconnect(connectionId);
+      console.log('Reconnect response:', response.data);
       
       if (response.data.loginUrl) {
+        console.log('Opening authentication window with URL:', response.data.loginUrl);
+        
+        // Open authentication window
         const authWindow = window.open(
           response.data.loginUrl,
           'reconnect-auth',
@@ -277,34 +336,54 @@ const BrokerConnection: React.FC = () => {
         );
 
         if (authWindow) {
+          // Monitor for window close
           const checkClosed = setInterval(() => {
             if (authWindow.closed) {
+              console.log('Auth window closed, refreshing connections');
               clearInterval(checkClosed);
+              
+              // Refresh connections after window is closed
               setTimeout(() => {
                 fetchConnections();
+                setReconnectingConnection(null);
+                toast.success('Authentication completed. Refreshing connection status...');
               }, 2000);
             }
           }, 1000);
 
+          // Set a timeout to close the window after 5 minutes
           setTimeout(() => {
             if (!authWindow.closed) {
+              console.log('Auth window timeout reached, closing window');
               authWindow.close();
               clearInterval(checkClosed);
+              setReconnectingConnection(null);
+              toast.warn('Authentication window timed out. Please try again if needed.');
             }
           }, 300000);
         } else {
+          setReconnectingConnection(null);
           toast.error('Failed to open authentication window. Please check your popup blocker.');
         }
       } else if (response.data.authType === 'credentials') {
         // Handle manual authentication for Angel/Shoonya
+        console.log('Manual authentication required for broker:', response.data.brokerName);
+        
         if (response.data.brokerName?.toLowerCase().includes('angel')) {
           setAngelAuthData({ connectionId });
           setShowAngelAuth(true);
         } else if (response.data.brokerName?.toLowerCase().includes('shoonya')) {
-          setShoonyaAuthData({ connectionId });
+          // Use stored credentials from reconnection response
+          setShoonyaAuthData({ 
+            connectionId, 
+            storedCredentials: response.data.storedCredentials || {}
+          });
           setShowShoonyaAuth(true);
         }
+        setReconnectingConnection(null);
       } else {
+        // Direct reconnection successful
+        console.log('Reconnected successfully using stored credentials');
         toast.success('Reconnected successfully using stored credentials!');
         fetchConnections();
         setReconnectingConnection(null);
@@ -363,7 +442,8 @@ const BrokerConnection: React.FC = () => {
       setIsSubmitting(true);
       const response = await brokerAPI.shoonyaAuth({
         connectionId: shoonyaAuthData.connectionId,
-        ...authData
+        password: authData.password,
+        twoFA: authData.twoFA
       });
       
       if (response.data.success) {
@@ -373,7 +453,18 @@ const BrokerConnection: React.FC = () => {
         fetchConnections();
       }
     } catch (error: any) {
-      toast.error(error.response?.data?.error || 'Shoonya authentication failed');
+      console.error('Shoonya authentication error:', error);
+      const errorMessage = error.response?.data?.error || 'Shoonya authentication failed';
+      toast.error(errorMessage);
+      
+      if (error.response?.data?.details) {
+        const details = error.response.data.details;
+        if (Array.isArray(details)) {
+          details.forEach(detail => {
+            toast.error(detail);
+          });
+        }
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -383,13 +474,21 @@ const BrokerConnection: React.FC = () => {
     if (!confirm('Are you sure you want to disconnect this broker?')) return;
 
     try {
+      console.log('Disconnecting broker connection:', connectionId);
       await brokerAPI.disconnect(connectionId);
       toast.success('Broker disconnected successfully!');
+      
+      // Update the local state immediately
       setConnections(prev => prev.map(conn => 
         conn.id === connectionId ? { ...conn, is_active: false } : conn
       ));
-      fetchConnections();
+      
+      // Then refresh from server
+      setTimeout(() => {
+        fetchConnections();
+      }, 1000);
     } catch (error: any) {
+      console.error('Failed to disconnect broker:', error);
       toast.error(error.response?.data?.error || 'Failed to disconnect broker');
     }
   };
@@ -667,72 +766,69 @@ const BrokerConnection: React.FC = () => {
                   )}
 
                   {/* Action Buttons */}
+                  {/* Replace your entire original block with this */}
                   <div className="space-y-2">
-                    {connection.is_authenticated && !statusInfo.needsReconnect && (
+                    {connection.is_authenticated && !statusInfo.needsReconnect ? (
                       <div className="grid grid-cols-2 gap-2">
-                        <motion.button 
+                        <ConnectionButton
                           onClick={() => syncPositions(connection.id)}
                           disabled={syncingConnection === connection.id}
-                          whileHover={{ scale: 1.05 }}
-                          whileTap={{ scale: 0.95 }}
-                          className="bg-amber-500 text-white py-2 px-3 rounded-lg hover:bg-amber-600 transition-colors flex items-center justify-center space-x-1 text-sm disabled:opacity-50 shadow-3d"
+                          icon={RefreshCw}
+                          iconAnimation={syncingConnection === connection.id ? 'animate-spin' : ''}
+                          className="bg-amber-500 text-white hover:bg-amber-600"
                         >
-                          <RefreshCw className={`w-3 h-3 ${syncingConnection === connection.id ? 'animate-spin' : ''}`} />
-                          <span>Sync</span>
-                        </motion.button>
+                          Sync
+                        </ConnectionButton>
 
-                        <motion.button
+                        <ConnectionButton
                           onClick={() => testConnection(connection.id)}
                           disabled={testingConnection === connection.id}
-                          whileHover={{ scale: 1.05 }}
-                          whileTap={{ scale: 0.95 }}
-                          className="bg-blue-500 text-white py-2 px-3 rounded-lg hover:bg-blue-600 transition-colors flex items-center justify-center space-x-1 text-sm disabled:opacity-50 shadow-3d"
+                          icon={TestTube}
+                          iconAnimation={testingConnection === connection.id ? 'animate-pulse' : ''}
+                          className="bg-blue-500 text-white hover:bg-blue-600"
                         >
-                          <TestTube className={`w-3 h-3 ${testingConnection === connection.id ? 'animate-pulse' : ''}`} />
-                          <span>Test</span>
-                        </motion.button>
+                          Test
+                        </ConnectionButton>
                       </div>
-                    )}
+                    ) : null}
 
-                    <motion.button 
+                    <ConnectionButton
                       onClick={() => handleEditConnection(connection)}
-                      whileHover={{ scale: 1.02 }}
-                      whileTap={{ scale: 0.98 }}
-                      className="w-full bg-bronze-500 text-white py-2 rounded-lg hover:bg-bronze-600 transition-colors flex items-center justify-center space-x-2 text-sm shadow-3d"
+                      icon={Edit3}
+                      className="w-full bg-bronze-500 text-white hover:bg-bronze-600 space-x-2"
+                      hoverScale={1.02}
+                      tapScale={0.98}
                     >
-                      <Edit3 className="w-4 h-4" />
-                      <span>Edit Settings</span>
-                    </motion.button>
-                    
-                    {/* Connection Management Buttons */}
+                      Edit Settings
+                    </ConnectionButton>
+
                     {connection.is_active ? (
-                      <motion.button
+                      <ConnectionButton
                         onClick={() => disconnectBroker(connection.id)}
-                        whileHover={{ scale: 1.02 }}
-                        whileTap={{ scale: 0.98 }}
-                        className="w-full bg-red-100 text-red-600 py-2 rounded-lg hover:bg-red-200 transition-colors text-sm border border-red-200"
+                        icon={null}
+                        className="w-full bg-red-100 text-red-600 hover:bg-red-200 border border-red-200"
+                        hoverScale={1.02}
+                        tapScale={0.98}
                       >
                         Disconnect
-                      </motion.button>
+                      </ConnectionButton>
                     ) : (
                       <div className="space-y-2">
-                        <motion.button
+                        <ConnectionButton
                           onClick={() => deleteBrokerConnection(connection.id)}
                           disabled={deletingConnection === connection.id}
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          className="w-full bg-red-500 text-white py-2 rounded-lg hover:bg-red-600 transition-colors flex items-center justify-center space-x-1 text-sm disabled:opacity-50 shadow-3d"
+                          icon={deletingConnection === connection.id ? RefreshCw : Trash2}
+                          iconAnimation={deletingConnection === connection.id ? 'animate-spin' : ''}
+                          className="w-full bg-red-500 text-white hover:bg-red-600"
+                          hoverScale={1.02}
+                          tapScale={0.98}
                         >
-                          {deletingConnection === connection.id ? (
-                            <RefreshCw className="w-4 h-4 animate-spin" />
-                          ) : (
-                            <Trash2 className="w-4 h-4" />
-                          )}
-                          <span>Delete</span>
-                        </motion.button>
+                          Delete
+                        </ConnectionButton>
                       </div>
                     )}
                   </div>
+
                 </motion.div>
               );
             })}
@@ -889,6 +985,7 @@ const BrokerConnection: React.FC = () => {
               setShoonyaAuthData(null);
             }}
             isLoading={isSubmitting}
+            storedCredentials={shoonyaAuthData.storedCredentials}
           />
         )}
       </AnimatePresence>
@@ -986,29 +1083,33 @@ const BrokerConnection: React.FC = () => {
                       )}
                     </div>
 
-                    <div>
-                      <label className="block text-sm font-medium text-bronze-700 mb-2">
-                        API Secret
-                      </label>
-                      <div className="relative">
-                        <input
-                          {...register('apiSecret', { required: 'API Secret is required' })}
-                          type={showApiSecret ? 'text' : 'password'}
-                          className="w-full px-4 py-3 pr-12 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
-                          placeholder="Enter your API secret"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowApiSecret(!showApiSecret)}
-                          className="absolute right-3 top-1/2 transform -translate-y-1/2 text-bronze-400 hover:text-bronze-600 transition-colors"
-                        >
-                          {showApiSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                        </button>
+                    {selectedBroker !== 'shoonya' && (
+                      <div>
+                        <label className="block text-sm font-medium text-bronze-700 mb-2">
+                          API Secret
+                        </label>
+                        <div className="relative">
+                          <input
+                            {...register('apiSecret', { 
+                              required: 'API Secret is required' 
+                            })}
+                            type={showApiSecret ? 'text' : 'password'}
+                            className="w-full px-4 py-3 pr-12 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                            placeholder="Enter your API secret"
+                          />
+                            <button
+                              type="button"
+                              onClick={() => setShowApiSecret(!showApiSecret)}
+                              className="absolute right-3 top-1/2 transform -translate-y-1/2 text-bronze-400 hover:text-bronze-600 transition-colors"
+                            >
+                              {showApiSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                            </button>
+                          </div>
+                          {errors.apiSecret && (
+                            <p className="mt-1 text-sm text-red-600">{errors.apiSecret.message}</p>
+                          )}
                       </div>
-                      {errors.apiSecret && (
-                        <p className="mt-1 text-sm text-red-600">{errors.apiSecret.message}</p>
-                      )}
-                    </div>
+                    )}
 
                     {/* Redirect URI field - only for Upstox */}
                     {selectedBroker === 'upstox' && (
@@ -1023,7 +1124,6 @@ const BrokerConnection: React.FC = () => {
                           type="url"
                           className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
                           placeholder="http://localhost:3001/api/broker/auth/upstox/callback"
-                          defaultValue="http://localhost:3001/api/broker/auth/upstox/callback"
                         />
                         {errors.redirectUri && (
                           <p className="mt-1 text-sm text-red-600">{errors.redirectUri.message}</p>
@@ -1048,6 +1148,49 @@ const BrokerConnection: React.FC = () => {
                         <p className="mt-1 text-sm text-red-600">{errors.userId.message}</p>
                       )}
                     </div>
+
+                    {/* Shoonya-specific fields */}
+                    {selectedBroker === 'shoonya' && (
+                      <>
+                        <div>
+                          <label className="block text-sm font-medium text-bronze-700 mb-2">
+                            Vendor Code
+                          </label>
+                          <input
+                            {...register('vendorCode', { required: 'Vendor code is required for Shoonya' })}
+                            type="text"
+                            className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                            placeholder="Enter vendor code"
+                          />
+                          {errors.vendorCode && (
+                            <p className="mt-1 text-sm text-red-600">{errors.vendorCode.message}</p>
+                          )}
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-bronze-700 mb-2">
+                            IMEI
+                          </label>
+                          <input
+                            {...register('imei', { required: 'IMEI is required for Shoonya' })}
+                            type="text"
+                            className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                            placeholder="Enter IMEI"
+                          />
+                          {errors.imei && (
+                            <p className="mt-1 text-sm text-red-600">{errors.imei.message}</p>
+                          )}
+                        </div>
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                          <div className="flex items-center space-x-2 mb-2">
+                            <AlertCircle className="w-4 h-4 text-amber-600" />
+                            <span className="text-amber-700 text-sm font-medium">Authentication Note</span>
+                          </div>
+                          <p className="text-amber-600 text-xs">
+                            Password and 2FA/TOTP will be requested during the authentication process.
+                          </p>
+                        </div>
+                      </>
+                    )}
 
                     <div className="flex space-x-4">
                       <motion.button
@@ -1152,26 +1295,28 @@ const BrokerConnection: React.FC = () => {
                   />
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-bronze-700 mb-2">
-                    API Secret
-                  </label>
-                  <div className="relative">
-                    <input
-                      {...register('apiSecret')}
-                      type={showApiSecret ? 'text' : 'password'}
-                      className="w-full px-4 py-3 pr-12 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
-                      placeholder="Enter new API secret"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiSecret(!showApiSecret)}
-                      className="absolute right-3 top-1/2 transform -translate-y-1/2 text-bronze-400 hover:text-bronze-600 transition-colors"
-                    >
-                      {showApiSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                    </button>
+                {editingConnection?.broker_name !== 'shoonya' && (
+                  <div>
+                    <label className="block text-sm font-medium text-bronze-700 mb-2">
+                      API Secret
+                    </label>
+                    <div className="relative">
+                      <input
+                        {...register('apiSecret')}
+                        type={showApiSecret ? 'text' : 'password'}
+                        className="w-full px-4 py-3 pr-12 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                        placeholder="Enter new API secret"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowApiSecret(!showApiSecret)}
+                        className="absolute right-3 top-1/2 transform -translate-y-1/2 text-bronze-400 hover:text-bronze-600 transition-colors"
+                      >
+                        {showApiSecret ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                      </button>
+                    </div>
                   </div>
-                </div>
+                )}
 
                 {/* Redirect URI field - only for Upstox */}
                 {editingConnection?.broker_name === 'upstox' && (
@@ -1210,6 +1355,46 @@ const BrokerConnection: React.FC = () => {
                     <p className="mt-1 text-sm text-red-600">{errors.userId.message}</p>
                   )}
                 </div>
+
+                {/* Shoonya-specific fields */}
+                {editingConnection.broker_name === 'shoonya' && (
+                  <>
+                    <div>
+                      <label className="block text-sm font-medium text-bronze-700 mb-2">
+                        Vendor Code
+                      </label>
+                      <input
+                        {...register('vendorCode', { required: 'Vendor code is required for Shoonya' })}
+                        type="text"
+                        className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                        placeholder="Enter vendor code"
+                      />
+                      {errors.vendorCode && (
+                        <p className="mt-1 text-sm text-red-600">{errors.vendorCode.message}</p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-bronze-700 mb-2">
+                        IMEI (Optional)
+                      </label>
+                      <input
+                        {...register('imei')}
+                        type="text"
+                        className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent backdrop-blur-sm"
+                        placeholder="Enter IMEI (optional)"
+                      />
+                    </div>
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                      <div className="flex items-center space-x-2 mb-2">
+                        <AlertCircle className="w-4 h-4 text-amber-600" />
+                        <span className="text-amber-700 text-sm font-medium">Authentication Note</span>
+                      </div>
+                      <p className="text-amber-600 text-xs">
+                        Password and 2FA/TOTP will be requested during the authentication process.
+                      </p>
+                    </div>
+                  </>
+                )}
 
                 <div className="flex space-x-4">
                   <motion.button
@@ -1330,7 +1515,8 @@ const ShoonyaAuthModal: React.FC<{
   onSubmit: (data: any) => void;
   onClose: () => void;
   isLoading: boolean;
-}> = ({ onSubmit, onClose, isLoading }) => {
+  storedCredentials?: any;
+}> = ({ onSubmit, onClose, isLoading, storedCredentials }) => {
   const { register, handleSubmit, formState: { errors } } = useForm();
 
   return (
@@ -1351,24 +1537,38 @@ const ShoonyaAuthModal: React.FC<{
           <button onClick={onClose} className="text-bronze-600 hover:text-bronze-500">✕</button>
         </div>
 
-        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-bronze-700 mb-2">User ID</label>
-            <input
-              {...register('userId', { required: 'User ID is required' })}
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
-              placeholder="Enter your user ID"
-            />
-            {errors.userId && <p className="text-red-600 text-sm mt-1">{errors.userId.message}</p>}
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-4">
+          <div className="flex items-center space-x-2 mb-2">
+            <AlertCircle className="w-4 h-4 text-amber-600" />
+            <span className="text-amber-700 text-sm font-medium">Authentication Required</span>
           </div>
+          <p className="text-amber-600 text-xs">
+            Your stored credentials will be used. Only enter your current Password and 2FA/TOTP code.
+          </p>
+        </div>
 
+        {/* Pre-filled credentials info */}
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
+          <div className="flex items-center space-x-2 mb-2">
+            <CheckCircle className="w-4 h-4 text-green-600" />
+            <span className="text-green-700 text-sm font-medium">Stored Credentials</span>
+          </div>
+          <div className="text-xs text-green-600 space-y-1">
+            <p><strong>User ID:</strong> {storedCredentials?.user_id_broker || 'Not set'}</p>
+            <p><strong>Vendor Code:</strong> {storedCredentials?.vendor_code || 'Not set'}</p>
+            <p><strong>API Key:</strong> {storedCredentials?.api_key ? '●●●●●●●●' : 'Not set'}</p>
+            <p><strong>IMEI:</strong> {storedCredentials?.imei || 'Not set'}</p>
+          </div>
+        </div>
+
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-4">
           <div>
             <label className="block text-sm font-medium text-bronze-700 mb-2">Password</label>
             <input
               {...register('password', { required: 'Password is required' })}
               type="password"
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
-              placeholder="Enter your password"
+              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent"
+              placeholder="Enter your current password"
             />
             {errors.password && <p className="text-red-600 text-sm mt-1">{errors.password.message}</p>}
           </div>
@@ -1377,54 +1577,24 @@ const ShoonyaAuthModal: React.FC<{
             <label className="block text-sm font-medium text-bronze-700 mb-2">2FA/TOTP</label>
             <input
               {...register('twoFA', { required: '2FA is required' })}
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
+              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl text-bronze-800 placeholder-bronze-400 focus:ring-2 focus:ring-amber-500 focus:border-transparent"
               placeholder="Enter 2FA/TOTP code"
             />
             {errors.twoFA && <p className="text-red-600 text-sm mt-1">{errors.twoFA.message}</p>}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-bronze-700 mb-2">Vendor Code</label>
-            <input
-              {...register('vendorCode', { required: 'Vendor code is required' })}
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
-              placeholder="Enter vendor code"
-            />
-            {errors.vendorCode && <p className="text-red-600 text-sm mt-1">{errors.vendorCode.message}</p>}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-bronze-700 mb-2">API Secret</label>
-            <input
-              {...register('apiSecret', { required: 'API secret is required' })}
-              type="password"
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
-              placeholder="Enter API secret"
-            />
-            {errors.apiSecret && <p className="text-red-600 text-sm mt-1">{errors.apiSecret.message}</p>}
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-bronze-700 mb-2">IMEI (Optional)</label>
-            <input
-              {...register('imei')}
-              className="w-full px-4 py-3 bg-cream-50 border border-beige-200 rounded-xl"
-              placeholder="Enter IMEI (optional)"
-            />
           </div>
 
           <div className="flex space-x-4">
             <button
               type="submit"
               disabled={isLoading}
-              className="flex-1 bg-gradient-to-r from-amber-500 to-bronze-600 text-white py-3 rounded-xl font-medium disabled:opacity-50"
+              className="flex-1 bg-gradient-to-r from-amber-500 to-bronze-600 text-white py-3 rounded-xl font-medium disabled:opacity-50 shadow-3d hover:shadow-3d-hover transition-all"
             >
               {isLoading ? 'Authenticating...' : 'Authenticate'}
             </button>
             <button
               type="button"
               onClick={onClose}
-              className="px-6 py-3 bg-beige-100 text-bronze-700 rounded-xl font-medium"
+              className="px-6 py-3 bg-beige-100 text-bronze-700 rounded-xl font-medium border border-beige-200 hover:bg-beige-200 transition-colors"
             >
               Cancel
             </button>
