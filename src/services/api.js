@@ -262,6 +262,23 @@ export const symbolsAPI = {
       params: { date },
       responseType: 'blob'
     }),
+  
+  // Generate webhook payload for specific symbol and broker
+  generateWebhookPayload: (data) => api.post('/symbols/webhook/generate', data),
+  
+  // Validate symbol for broker compatibility
+  validateSymbol: (data) => api.post('/symbols/validate', data),
+  
+  // Get webhook mapping for symbol
+  getWebhookMapping: (broker, symbol, exchange) => 
+    api.get(`/symbols/webhook-mapping/${broker}/${symbol}/${exchange}`),
+  
+  // Force sync for specific broker
+  forceSyncBroker: (broker) => api.post(`/symbols/force-sync/${broker}`),
+  
+  // Get cached instruments for broker
+  getCachedInstruments: (broker, limit = 100) => 
+    api.get(`/symbols/cache/${broker}`, { params: { limit } }),
 };
 
 export default api;

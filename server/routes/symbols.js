@@ -112,6 +112,108 @@ router.get('/search', authenticateToken, async (req, res) => {
   }
 });
 
+// Generate webhook payload for specific symbol and broker
+router.post('/webhook/generate', authenticateToken, async (req, res) => {
+  try {
+    const { symbol, exchange, brokerName, orderParams = {} } = req.body;
+    
+    if (!symbol || !exchange || !brokerName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Symbol, exchange, and brokerName are required'
+      });
+    }
+    
+    logger.info(`Generating webhook payload for ${symbol} on ${exchange} for ${brokerName}`);
+    
+    const webhookData = await symbolSyncService.generateWebhookPayload(
+      symbol, 
+      exchange, 
+      brokerName, 
+      orderParams
+    );
+    
+    res.json({
+      success: true,
+      data: webhookData
+    });
+    
+  } catch (error) {
+    logger.error('Failed to generate webhook payload:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to generate webhook payload',
+      error: error.message
+    });
+  }
+});
+
+// Validate symbol for broker compatibility
+router.post('/validate', authenticateToken, async (req, res) => {
+  try {
+    const { symbol, exchange, brokerName } = req.body;
+    
+    if (!symbol || !exchange || !brokerName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Symbol, exchange, and brokerName are required'
+      });
+    }
+    
+    logger.info(`Validating symbol ${symbol} for broker ${brokerName}`);
+    
+    const validation = await symbolSyncService.validateSymbolForBroker(
+      symbol, 
+      exchange, 
+      brokerName
+    );
+    
+    res.json({
+      success: true,
+      data: validation
+    });
+    
+  } catch (error) {
+    logger.error('Failed to validate symbol:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to validate symbol',
+      error: error.message
+    });
+  }
+});
+
+// Get symbol mapping for webhook
+router.get('/webhook-mapping/:broker/:symbol/:exchange', authenticateToken, async (req, res) => {
+  try {
+    const { broker, symbol, exchange } = req.params;
+    
+    logger.info(`Getting webhook mapping for ${symbol} on ${exchange} for ${broker}`);
+    
+    const mapping = await symbolSyncService.getSymbolMappingForWebhook(symbol, exchange, broker);
+    
+    if (!mapping) {
+      return res.status(404).json({
+        success: false,
+        message: 'Symbol mapping not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: mapping
+    });
+    
+  } catch (error) {
+    logger.error('Failed to get webhook mapping:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get webhook mapping',
+      error: error.message
+    });
+  }
+});
+
 // Get broker-specific symbol mapping
 router.get('/mapping/:broker/:symbol/:exchange', authenticateToken, async (req, res) => {
   try {
@@ -436,6 +538,65 @@ router.get('/download/:broker/:type', authenticateToken, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to download file',
+      error: error.message
+    });
+  }
+});
+
+// Force sync for specific broker (admin endpoint)
+router.post('/force-sync/:broker', authenticateToken, async (req, res) => {
+  try {
+    const { broker } = req.params;
+    logger.info(`Force syncing symbols for ${broker}`);
+    
+    // Clear the last sync date to force sync
+    symbolSyncService.lastSyncDate.delete(broker);
+    
+    // Start sync
+    const result = await symbolSyncService.syncBrokerSymbols(broker);
+    
+    res.json({
+      success: true,
+      message: `Force sync completed for ${broker}`,
+      data: result
+    });
+    
+  } catch (error) {
+    logger.error(`Failed to force sync for ${req.params.broker}:`, error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to force sync',
+      error: error.message
+    });
+  }
+});
+
+// Get cached instruments for a broker
+router.get('/cache/:broker', authenticateToken, async (req, res) => {
+  try {
+    const { broker } = req.params;
+    const { limit = 100 } = req.query;
+    
+    logger.info(`Getting cached instruments for ${broker}`);
+    
+    const cachedInstruments = symbolSyncService.getCachedInstruments(broker);
+    const limitedResults = cachedInstruments.slice(0, parseInt(limit));
+    
+    res.json({
+      success: true,
+      data: {
+        broker: broker,
+        total_cached: cachedInstruments.length,
+        returned: limitedResults.length,
+        instruments: limitedResults
+      }
+    });
+    
+  } catch (error) {
+    logger.error('Failed to get cached instruments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get cached instruments',
       error: error.message
     });
   }

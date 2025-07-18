@@ -1,6 +1,7 @@
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
+import cron from 'node-cron';
 import { db } from '../database/init.js';
 import { createLogger } from '../utils/logger.js';
 import { decryptData } from '../utils/encryption.js';
@@ -11,8 +12,11 @@ class SymbolSyncService {
   constructor() {
     this.syncInProgress = new Set(); // Track ongoing sync operations
     this.dataDir = path.join(process.cwd(), 'data', 'symbols');
+    this.lastSyncDate = new Map(); // Track last sync date for each broker
+    this.instrumentCache = new Map(); // Cache instrument data
     this.initializeDataDirectory();
     this.initializeDefaultSyncStatus();
+    this.scheduleDailySync();
   }
 
   // Initialize data directory for storing symbol files
@@ -52,6 +56,55 @@ class SymbolSyncService {
     }
   }
 
+  // Schedule daily sync at 6 AM IST
+  scheduleDailySync() {
+    // Run daily at 6:00 AM IST (00:30 UTC)
+    cron.schedule('30 0 * * *', async () => {
+      logger.info('Starting scheduled daily symbol sync');
+      try {
+        await this.syncAllBrokers();
+        logger.info('Scheduled daily symbol sync completed successfully');
+      } catch (error) {
+        logger.error('Scheduled daily symbol sync failed:', error);
+      }
+    }, {
+      timezone: 'Asia/Kolkata'
+    });
+    
+    logger.info('Daily symbol sync scheduled for 6:00 AM IST');
+  }
+
+  // Check if sync is needed (once per day)
+  async isSyncNeeded(brokerName) {
+    const today = new Date().toDateString();
+    const lastSync = this.lastSyncDate.get(brokerName);
+    
+    if (!lastSync || lastSync !== today) {
+      return true;
+    }
+    
+    // Also check database for last sync
+    try {
+      const syncStatus = await db.getAsync(
+        'SELECT last_sync_at FROM symbol_sync_status WHERE broker_name = ?',
+        [brokerName]
+      );
+      
+      if (!syncStatus || !syncStatus.last_sync_at) {
+        return true;
+      }
+      
+      const lastSyncDate = new Date(syncStatus.last_sync_at);
+      const todayDate = new Date();
+      
+      // Check if last sync was today
+      return lastSyncDate.toDateString() !== todayDate.toDateString();
+    } catch (error) {
+      logger.error('Error checking sync status:', error);
+      return true; // Sync if we can't determine status
+    }
+  }
+
   // Main method to sync symbols for all brokers
   async syncAllBrokers() {
     try {
@@ -61,8 +114,18 @@ class SymbolSyncService {
       const results = {};
       
       for (const broker of brokers) {
+        // Check if sync is needed for this broker
+        const needsSync = await this.isSyncNeeded(broker);
+        if (!needsSync) {
+          logger.info(`Skipping ${broker} - already synced today`);
+          results[broker] = { success: true, skipped: true, reason: 'Already synced today' };
+          continue;
+        }
+        
         try {
           results[broker] = await this.syncBrokerSymbols(broker);
+          // Mark as synced today
+          this.lastSyncDate.set(broker, new Date().toDateString());
         } catch (error) {
           logger.error(`Failed to sync symbols for ${broker}:`, error);
           results[broker] = { success: false, error: error.message };
@@ -189,6 +252,7 @@ class SymbolSyncService {
             instrument[header.trim()] = values[index]?.trim() || '';
           });
           
+          // Enhanced symbol mapping with all required fields
           symbols.push({
             symbol: instrument.tradingsymbol,
             name: instrument.name,
@@ -202,10 +266,14 @@ class SymbolSyncService {
             option_type: instrument.option_type || null,
             broker_token: instrument.instrument_token,
             broker_exchange: instrument.exchange,
+            broker_symbol: instrument.tradingsymbol,
             // Additional Zerodha specific fields
             isin: instrument.isin || null,
             last_price: parseFloat(instrument.last_price) || null,
-            multiplier: parseFloat(instrument.multiplier) || 1
+            multiplier: parseFloat(instrument.multiplier) || 1,
+            // Webhook format fields
+            tradingsymbol: instrument.tradingsymbol,
+            instrument_token: instrument.instrument_token
           });
         }
       }
@@ -327,9 +395,13 @@ class SymbolSyncService {
               option_type: instrument.option_type || instrument.optiontype || null,
               broker_token: instrument.instrument_key || instrument.token || instrument.instrument_token,
               broker_exchange: instrument.exchange,
+              broker_symbol: instrument.trading_symbol || instrument.symbol,
               // Additional Upstox specific fields
               isin: instrument.isin || null,
-              weekly_expiry: instrument.weekly_expiry || null
+              weekly_expiry: instrument.weekly_expiry || null,
+              // Webhook format fields
+              instrument_token: instrument.instrument_key || instrument.token,
+              trading_symbol: instrument.trading_symbol || instrument.symbol
             };
             
             // Only add if we have essential fields
@@ -356,8 +428,12 @@ class SymbolSyncService {
               option_type: instrument.option_type || null,
               broker_token: instrument.instrument_key,
               broker_exchange: instrument.exchange,
+              broker_symbol: instrument.trading_symbol,
               isin: instrument.isin || null,
-              weekly_expiry: instrument.weekly_expiry || null
+              weekly_expiry: instrument.weekly_expiry || null,
+              // Webhook format fields
+              instrument_token: instrument.instrument_key,
+              trading_symbol: instrument.trading_symbol
             });
           }
         }
@@ -402,10 +478,14 @@ class SymbolSyncService {
               option_type: instrument.option_type || null,
               broker_token: instrument.token,
               broker_exchange: instrument.exch_seg,
+              broker_symbol: instrument.symbol,
               // Additional Angel specific fields
               isin: instrument.isin || null,
               symbol_token: instrument.symboltoken || null,
-              precision: parseInt(instrument.precision) || 2
+              precision: parseInt(instrument.precision) || 2,
+              // Webhook format fields
+              symboltoken: instrument.symboltoken || instrument.token,
+              tradingsymbol: instrument.symbol
             });
           }
         }
@@ -454,9 +534,13 @@ class SymbolSyncService {
                   option_type: instrument.option_type || null,
                   broker_token: instrument.token || instrument.symboltoken,
                   broker_exchange: exchange.name,
+                  broker_symbol: instrument.symbol || instrument.trading_symbol,
                   isin: instrument.isin || null,
                   symbol_token: instrument.symboltoken || null,
-                  precision: parseInt(instrument.precision) || 2
+                  precision: parseInt(instrument.precision) || 2,
+                  // Webhook format fields
+                  symboltoken: instrument.symboltoken || instrument.token,
+                  tradingsymbol: instrument.symbol || instrument.trading_symbol
                 });
               }
             }
@@ -538,9 +622,13 @@ class SymbolSyncService {
                   option_type: values[7] || null,
                   broker_token: values[8] || values[0], // Use symbol as token if not available
                   broker_exchange: endpoint.name,
+                  broker_symbol: values[0]?.trim(),
                   // Additional Shoonya specific fields
                   token: values[8] || null,
-                  precision: parseInt(values[9]) || 2
+                  precision: parseInt(values[9]) || 2,
+                  // Webhook format fields
+                  tsym: values[0]?.trim(),
+                  exch: endpoint.name
                 };
                 
                 // Only add if we have essential fields
@@ -594,8 +682,141 @@ class SymbolSyncService {
       return symbols;
       
     } catch (error) {
+  // Get cached instrument data for a broker
+  getCachedInstruments(brokerName) {
+    return this.instrumentCache.get(brokerName) || [];
+  }
+
+  // Cache instrument data
+  setCachedInstruments(brokerName, instruments) {
+    this.instrumentCache.set(brokerName, instruments);
+    logger.info(`Cached ${instruments.length} instruments for ${brokerName}`);
+  }
+
+  // Get symbol with broker-specific token
+  async getSymbolWithBrokerToken(symbol, exchange, brokerName) {
+    try {
+      const result = await db.getAsync(`
+        SELECT 
+          i.symbol, i.name, i.exchange, i.segment, i.instrument_type,
+          i.lot_size, i.tick_size, i.expiry_date, i.strike_price, i.option_type,
+          bim.broker_symbol, bim.broker_token, bim.broker_exchange
+        FROM instruments i
+        JOIN broker_instrument_mappings bim ON i.id = bim.instrument_id
+        WHERE i.symbol = ? AND i.exchange = ? AND bim.broker_name = ? AND bim.is_active = 1
+        ORDER BY bim.updated_at DESC LIMIT 1
+      `, [symbol, exchange, brokerName]);
+      
+      return result;
+    } catch (error) {
+      logger.error('Failed to get symbol with broker token:', error);
+      return null;
+    }
+  }
+
+  // Generate webhook payload for specific broker
+  async generateWebhookPayload(symbol, exchange, brokerName, orderParams = {}) {
+    try {
+      const symbolData = await this.getSymbolWithBrokerToken(symbol, exchange, brokerName);
+      
+      if (!symbolData) {
+        throw new Error(`Symbol ${symbol} not found for broker ${brokerName}`);
+      }
+
+      const defaultParams = {
+        action: 'BUY',
+        quantity: 1,
+        order_type: 'MARKET',
+        product: 'MIS',
+        validity: 'DAY',
+        price: 0,
+        trigger_price: 0,
+        disclosed_quantity: 0,
+        tag: 'TradingView'
+      };
+
+      const params = { ...defaultParams, ...orderParams };
+      let payload = {};
+
+      switch (brokerName.toLowerCase()) {
+        case 'zerodha':
+          payload = {
+            symbol: symbolData.symbol,
+            action: params.action,
+            quantity: parseInt(params.quantity),
+            order_type: params.order_type,
+            product: params.product,
+            exchange: symbolData.exchange,
+            validity: params.validity,
+            price: params.order_type === 'LIMIT' ? parseFloat(params.price) : 0,
+            trigger_price: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price) : 0,
+            disclosed_quantity: parseInt(params.disclosed_quantity),
+            tag: params.tag
+          };
+          break;
+
+        case 'upstox':
+          payload = {
+            symbol: symbolData.symbol,
+            action: params.action,
+            quantity: parseInt(params.quantity),
+            order_type: params.order_type,
+            product: params.product === 'MIS' ? 'I' : (params.product === 'CNC' ? 'D' : 'I'),
+            exchange: symbolData.broker_exchange,
+            validity: params.validity,
+            price: params.order_type === 'LIMIT' ? parseFloat(params.price) : 0,
+            trigger_price: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price) : 0,
+            disclosed_quantity: parseInt(params.disclosed_quantity),
+            is_amo: false,
+            tag: params.tag,
+            instrument_token: symbolData.broker_token
+          };
+          break;
       logger.error('Failed to fetch Shoonya symbols:', error);
+        case 'angel':
+          payload = {
+            symbol: symbolData.broker_symbol,
+            symboltoken: symbolData.broker_token,
+            action: params.action,
+            quantity: parseInt(params.quantity),
+            order_type: params.order_type,
+            product: params.product === 'MIS' ? 'INTRADAY' : (params.product === 'CNC' ? 'DELIVERY' : 'INTRADAY'),
+            exchange: symbolData.exchange,
+            validity: params.validity,
+            price: params.order_type === 'LIMIT' ? parseFloat(params.price).toString() : '0',
+            squareoff: '0',
+            stoploss: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price).toString() : '0'
+          };
+          break;
       throw new Error(`Shoonya symbol fetch failed: ${error.message}`);
+        case 'shoonya':
+          payload = {
+            symbol: symbolData.symbol,
+            action: params.action === 'BUY' ? 'B' : 'S',
+            quantity: parseInt(params.quantity),
+            order_type: params.order_type === 'MARKET' ? 'MKT' : (params.order_type === 'LIMIT' ? 'LMT' : 'MKT'),
+            product: params.product === 'MIS' ? 'I' : (params.product === 'CNC' ? 'C' : 'I'),
+            exchange: symbolData.exchange,
+            validity: params.validity,
+            price: params.order_type === 'LIMIT' ? parseFloat(params.price).toString() : '0',
+            trigger_price: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price).toString() : '0'
+          };
+          break;
+    }
+        default:
+          throw new Error(`Unsupported broker: ${brokerName}`);
+      }
+  }
+      return {
+        broker: brokerName,
+        symbol_data: symbolData,
+        payload: payload,
+        webhook_format: `${brokerName}_webhook`
+      };
+
+    } catch (error) {
+      logger.error('Failed to generate webhook payload:', error);
+      throw error;
     }
   }
 
@@ -652,7 +873,7 @@ class SymbolSyncService {
             `, [
               instrument.id,
               brokerName,
-              symbol.symbol,
+              symbol.broker_symbol || symbol.symbol,
               symbol.broker_token,
               symbol.broker_exchange
             ]);
@@ -668,6 +889,9 @@ class SymbolSyncService {
           logger.warn(`Failed to store symbol ${symbol.symbol}:`, symbolError.message);
         }
       }
+      
+      // Cache the instruments for this broker
+      this.setCachedInstruments(brokerName, symbols);
       
       logger.info(`Symbol storage completed for ${brokerName}`, { stored, updated });
       return { stored, updated };
@@ -1359,6 +1583,99 @@ class SymbolSyncService {
     } catch (error) {
       logger.error('Failed to search symbols by segment:', error);
       throw error;
+    }
+  }
+  // Get comprehensive symbol mapping for webhook generation
+  async getSymbolMappingForWebhook(symbol, exchange, brokerName) {
+    try {
+      const result = await db.getAsync(`
+        SELECT 
+          i.id, i.symbol, i.name, i.exchange, i.segment, i.instrument_type,
+          i.lot_size, i.tick_size, i.expiry_date, i.strike_price, i.option_type,
+          bim.broker_symbol, bim.broker_token, bim.broker_exchange,
+          bim.updated_at as mapping_updated
+        FROM instruments i
+        JOIN broker_instrument_mappings bim ON i.id = bim.instrument_id
+        WHERE i.symbol = ? AND i.exchange = ? AND bim.broker_name = ? AND bim.is_active = 1
+        ORDER BY bim.updated_at DESC LIMIT 1
+      `, [symbol, exchange, brokerName]);
+      
+      if (!result) {
+        // Try fuzzy search
+        const fuzzyResult = await db.getAsync(`
+          SELECT 
+            i.id, i.symbol, i.name, i.exchange, i.segment, i.instrument_type,
+            i.lot_size, i.tick_size, i.expiry_date, i.strike_price, i.option_type,
+            bim.broker_symbol, bim.broker_token, bim.broker_exchange,
+            bim.updated_at as mapping_updated
+          FROM instruments i
+          JOIN broker_instrument_mappings bim ON i.id = bim.instrument_id
+          WHERE i.symbol LIKE ? AND i.exchange = ? AND bim.broker_name = ? AND bim.is_active = 1
+          ORDER BY bim.updated_at DESC LIMIT 1
+        `, [`%${symbol}%`, exchange, brokerName]);
+        
+        return fuzzyResult;
+      }
+      
+      return result;
+    } catch (error) {
+      logger.error('Failed to get symbol mapping for webhook:', error);
+      return null;
+    }
+  }
+
+  // Validate symbol for broker compatibility
+  async validateSymbolForBroker(symbol, exchange, brokerName) {
+    try {
+      const mapping = await this.getSymbolMappingForWebhook(symbol, exchange, brokerName);
+      
+      if (!mapping) {
+        return {
+          valid: false,
+          error: `Symbol ${symbol} not found for broker ${brokerName}`,
+          suggestions: await this.getSimilarSymbols(symbol, exchange, brokerName)
+        };
+      }
+      
+      return {
+        valid: true,
+        mapping: mapping,
+        broker_token: mapping.broker_token,
+        broker_symbol: mapping.broker_symbol
+      };
+    } catch (error) {
+      logger.error('Failed to validate symbol for broker:', error);
+      return {
+        valid: false,
+        error: error.message
+      };
+    }
+  }
+
+  // Get similar symbols for suggestions
+  async getSimilarSymbols(symbol, exchange, brokerName, limit = 5) {
+    try {
+      const results = await db.allAsync(`
+        SELECT DISTINCT 
+          i.symbol, i.name, i.exchange, i.segment,
+          bim.broker_symbol, bim.broker_token
+        FROM instruments i
+        JOIN broker_instrument_mappings bim ON i.id = bim.instrument_id
+        WHERE i.symbol LIKE ? AND i.exchange = ? AND bim.broker_name = ? AND bim.is_active = 1
+        ORDER BY 
+          CASE 
+            WHEN i.symbol = ? THEN 1
+            WHEN i.symbol LIKE ? THEN 2
+            ELSE 3
+          END,
+          i.symbol
+        LIMIT ?
+      `, [`%${symbol}%`, exchange, brokerName, symbol, `${symbol}%`, limit]);
+      
+      return results;
+    } catch (error) {
+      logger.error('Failed to get similar symbols:', error);
+      return [];
     }
   }
 }

@@ -370,6 +370,8 @@ export const initDatabase = async () => {
         broker_token TEXT,
         broker_exchange TEXT,
         is_active BOOLEAN DEFAULT 1,
+        webhook_format TEXT, -- Store broker-specific webhook format data
+        last_validated_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (instrument_id) REFERENCES instruments (id),
@@ -387,6 +389,8 @@ export const initDatabase = async () => {
         sync_status TEXT DEFAULT 'pending',
         total_symbols INTEGER DEFAULT 0,
         error_message TEXT,
+        sync_frequency TEXT DEFAULT 'daily', -- daily, weekly, manual
+        next_sync_at DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )

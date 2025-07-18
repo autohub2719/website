@@ -28,6 +28,8 @@ const SymbolsManagement: React.FC = () => {
   const [detailedSymbolInfo, setDetailedSymbolInfo] = useState<any>(null);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [symbolFiles, setSymbolFiles] = useState<any[]>([]);
+  const [testingWebhook, setTestingWebhook] = useState(false);
+  const [webhookTestResult, setWebhookTestResult] = useState<any>(null);
 
   useEffect(() => {
     fetchSyncStatus();
@@ -104,6 +106,54 @@ const SymbolsManagement: React.FC = () => {
       setDetailedSymbolInfo(null);
     } finally {
       setLoadingDetails(false);
+    }
+  };
+
+  const testWebhookGeneration = async () => {
+    if (!selectedSymbol) {
+      toast.error('Please select a symbol first');
+      return;
+    }
+    
+    setTestingWebhook(true);
+    try {
+      const response = await symbolsAPI.generateWebhookPayload({
+        symbol: selectedSymbol.symbol,
+        exchange: selectedSymbol.exchange,
+        brokerName: 'zerodha', // Test with Zerodha
+        orderParams: {
+          action: 'BUY',
+          quantity: 1,
+          order_type: 'MARKET',
+          product: 'MIS'
+        }
+      });
+      
+      setWebhookTestResult(response.data);
+      toast.success('Webhook payload generated successfully');
+    } catch (error) {
+      console.error('Webhook generation test failed:', error);
+      toast.error('Failed to generate webhook payload');
+      setWebhookTestResult(null);
+    } finally {
+      setTestingWebhook(false);
+    }
+  };
+
+  const forceSyncBroker = async (brokerName: string) => {
+    try {
+      setSyncing([brokerName]);
+      await symbolsAPI.forceSyncBroker(brokerName);
+      toast.success(`Force sync started for ${brokerName}`);
+      
+      // Refresh status after a delay
+      setTimeout(() => {
+        fetchSyncStatus();
+        setSyncing(prev => prev.filter(b => b !== brokerName));
+      }, 2000);
+    } catch (error) {
+      toast.error(`Failed to force sync ${brokerName}`);
+      setSyncing(prev => prev.filter(b => b !== brokerName));
     }
   };
 
@@ -394,6 +444,70 @@ const SymbolsManagement: React.FC = () => {
             </motion.div>
           )}
 
+          {/* Webhook Test Result */}
+          {webhookTestResult && (
+            <motion.div
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="p-6 bg-gradient-to-r from-green-50 to-emerald-50 border border-green-200 rounded-lg"
+            >
+              <h3 className="font-bold text-green-800 mb-4 flex items-center">
+                <Zap className="w-5 h-5 mr-2" />
+                Webhook Test Result: {webhookTestResult.broker}
+              </h3>
+              
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Symbol Data */}
+                <div className="space-y-3">
+                  <h4 className="font-semibold text-green-700 border-b border-green-200 pb-1">Symbol Information</h4>
+                  <div className="space-y-2 text-sm">
+                    <div className="grid grid-cols-2 gap-2">
+                      <span className="font-medium">Symbol:</span>
+                      <span>{webhookTestResult.symbol_data?.symbol}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <span className="font-medium">Exchange:</span>
+                      <span>{webhookTestResult.symbol_data?.exchange}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <span className="font-medium">Broker Token:</span>
+                      <span className="font-mono text-xs">{webhookTestResult.symbol_data?.broker_token}</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <span className="font-medium">Broker Symbol:</span>
+                      <span>{webhookTestResult.symbol_data?.broker_symbol}</span>
+                      
+                      <motion.button
+                        onClick={() => forceSyncBroker(status.broker_name)}
+                        disabled={syncing.includes(status.broker_name)}
+                        whileHover={{ scale: 1.05 }}
+                        whileTap={{ scale: 0.95 }}
+                        className="flex items-center space-x-1 bg-red-600 text-white px-3 py-1 rounded text-sm hover:bg-red-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {syncing.includes(status.broker_name) ? (
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <AlertCircle className="w-3 h-3" />
+                        )}
+                        <span>Force</span>
+                      </motion.button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Generated Payload */}
+                <div className="space-y-3">
+                  <h4 className="font-semibold text-green-700 border-b border-green-200 pb-1">Generated Payload</h4>
+                  <div className="bg-gray-900 rounded-lg p-3 overflow-x-auto">
+                    <pre className="text-green-400 text-xs">
+                      <code>{JSON.stringify(webhookTestResult.payload, null, 2)}</code>
+                    </pre>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
           {/* Detailed Symbol Information */}
           {detailedSymbolInfo && (
             <motion.div
@@ -600,18 +714,33 @@ const SymbolsManagement: React.FC = () => {
                   </div>
                   
                   <div className="space-y-1 text-sm text-bronze-600 mb-3">
-                    <p><strong>Date:</strong> {file.date === 'latest' ? 'Latest' : file.date}</p>
-                    <p><strong>Size:</strong> {(file.size / 1024).toFixed(1)} KB</p>
-                    <p><strong>Modified:</strong> {new Date(file.modified).toLocaleDateString()}</p>
+                  <div className="flex space-x-3">
+                    <button
+                      onClick={() => fetchDetailedSymbolInfo(selectedSymbol.symbol, selectedSymbol.exchange)}
+                      disabled={loadingDetails}
+                      className="flex items-center space-x-2 px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {loadingDetails ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Database className="w-4 h-4" />
+                      )}
+                      <span>{loadingDetails ? 'Loading...' : 'View Complete Details'}</span>
+                    </button>
+                    
+                    <button
+                      onClick={testWebhookGeneration}
+                      disabled={testingWebhook}
+                      className="flex items-center space-x-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {testingWebhook ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Zap className="w-4 h-4" />
+                      )}
+                      <span>{testingWebhook ? 'Testing...' : 'Test Webhook Generation'}</span>
+                    </button>
                   </div>
-                  
-                  <button
-                    onClick={() => downloadSymbolFile(file.broker, file.type, file.date)}
-                    className="w-full flex items-center justify-center space-x-2 px-3 py-2 bg-amber-600 text-white rounded hover:bg-amber-700 transition-colors text-sm"
-                  >
-                    <Download className="w-4 h-4" />
-                    <span>Download</span>
-                  </button>
                 </motion.div>
               ))}
             </div>

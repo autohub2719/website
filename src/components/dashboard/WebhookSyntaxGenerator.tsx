@@ -5,7 +5,7 @@ import {
   Zap, AlertCircle, BookOpen, ExternalLink, Play, FileText,
   Webhook, Database, Shield, Search
 } from 'lucide-react';
-import { brokerAPI } from '../../services/api';
+import { brokerAPI, symbolsAPI } from '../../services/api';
 import SymbolSearch from './SymbolSearch';
 import toast from 'react-hot-toast';
 
@@ -45,6 +45,9 @@ const WebhookSyntaxGenerator: React.FC = () => {
   const [generatedSyntax, setGeneratedSyntax] = useState<any>(null);
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
   const [brokerConnections, setBrokerConnections] = useState<any[]>([]);
+  const [selectedSymbolData, setSelectedSymbolData] = useState<any>(null);
+  const [validatingSymbol, setValidatingSymbol] = useState(false);
+  const [symbolValidation, setSymbolValidation] = useState<any>(null);
 
   // Comprehensive broker configurations
   const brokerConfigs: BrokerConfig[] = [
@@ -222,18 +225,23 @@ const WebhookSyntaxGenerator: React.FC = () => {
     const config = brokerConfigs.find(b => b.id === selectedBroker);
     if (!config) return;
 
+    // Use validated symbol data if available
+    const symbolToUse = selectedSymbolData?.symbol || customFields.symbol || 'RELIANCE';
+    const exchangeToUse = selectedSymbolData?.exchange || customFields.exchange || 'NSE';
+    const tokenToUse = selectedSymbolData?.broker_token || customFields.symboltoken || '2885';
+
     let payload: any = {};
 
-    // Generate payload based on broker type
+    // Generate enhanced payload based on broker type with actual symbol data
     switch (selectedBroker) {
       case 'zerodha':
         payload = {
-          symbol: customFields.symbol || 'RELIANCE',
+          symbol: symbolToUse,
           action: customFields.action || 'BUY',
           quantity: parseInt(customFields.quantity) || 1,
           order_type: customFields.order_type || 'MARKET',
           product: customFields.product || 'MIS',
-          exchange: customFields.exchange || 'NSE',
+          exchange: exchangeToUse,
           validity: customFields.validity || 'DAY',
           price: customFields.order_type === 'LIMIT' ? (parseFloat(customFields.price) || 0) : 0,
           trigger_price: ['SL', 'SL-M'].includes(customFields.order_type) ? (parseFloat(customFields.trigger_price) || 0) : 0,
@@ -244,30 +252,31 @@ const WebhookSyntaxGenerator: React.FC = () => {
 
       case 'upstox':
         payload = {
-          symbol: customFields.symbol || 'RELIANCE',
+          symbol: symbolToUse,
           action: customFields.action || 'BUY',
           quantity: parseInt(customFields.quantity) || 1,
           order_type: customFields.order_type || 'MARKET',
           product: customFields.product === 'MIS' ? 'I' : (customFields.product === 'CNC' ? 'D' : 'I'),
-          exchange: customFields.exchange === 'NSE' ? 'NSE_EQ' : (customFields.exchange || 'NSE_EQ'),
+          exchange: exchangeToUse === 'NSE' ? 'NSE_EQ' : exchangeToUse,
           validity: customFields.validity || 'DAY',
           price: customFields.order_type === 'LIMIT' ? (parseFloat(customFields.price) || 0) : 0,
           trigger_price: ['SL', 'SL-M'].includes(customFields.order_type) ? (parseFloat(customFields.trigger_price) || 0) : 0,
           disclosed_quantity: parseInt(customFields.disclosed_quantity) || 0,
           is_amo: customFields.is_amo || false,
-          tag: customFields.tag || 'TradingView'
+          tag: customFields.tag || 'TradingView',
+          instrument_token: tokenToUse
         };
         break;
 
       case 'angel':
         payload = {
-          symbol: (customFields.symbol || 'RELIANCE') + '-EQ',
-          symboltoken: customFields.symboltoken || '2885',
+          symbol: symbolToUse + (symbolToUse.includes('-') ? '' : '-EQ'),
+          symboltoken: tokenToUse,
           action: customFields.action || 'BUY',
           quantity: parseInt(customFields.quantity) || 1,
           order_type: customFields.order_type || 'MARKET',
           product: customFields.product === 'MIS' ? 'INTRADAY' : (customFields.product === 'CNC' ? 'DELIVERY' : 'INTRADAY'),
-          exchange: customFields.exchange || 'NSE',
+          exchange: exchangeToUse,
           validity: customFields.validity || 'DAY',
           price: customFields.order_type === 'LIMIT' ? (parseFloat(customFields.price) || 0).toString() : '0',
           squareoff: (parseFloat(customFields.squareoff) || 0).toString(),
@@ -277,12 +286,12 @@ const WebhookSyntaxGenerator: React.FC = () => {
 
       case 'shoonya':
         payload = {
-          symbol: customFields.symbol || 'RELIANCE',
+          symbol: symbolToUse,
           action: customFields.action === 'BUY' ? 'B' : 'S',
           quantity: parseInt(customFields.quantity) || 1,
           order_type: customFields.order_type === 'MARKET' ? 'MKT' : (customFields.order_type === 'LIMIT' ? 'LMT' : 'MKT'),
           product: customFields.product === 'MIS' ? 'I' : (customFields.product === 'CNC' ? 'C' : 'I'),
-          exchange: customFields.exchange || 'NSE',
+          exchange: exchangeToUse,
           validity: customFields.validity || 'DAY',
           price: customFields.order_type === 'LIMIT' ? (parseFloat(customFields.price) || 0).toString() : '0',
           trigger_price: ['SL', 'SL-M'].includes(customFields.order_type) ? (parseFloat(customFields.trigger_price) || 0).toString() : '0'
@@ -291,11 +300,11 @@ const WebhookSyntaxGenerator: React.FC = () => {
 
       case '5paisa':
         payload = {
-          symbol: customFields.symbol || 'RELIANCE',
+          symbol: symbolToUse,
           action: customFields.action === 'BUY' ? 'B' : 'S',
           quantity: parseInt(customFields.quantity) || 1,
           order_type: customFields.order_type === 'MARKET' ? 'M' : (customFields.order_type === 'LIMIT' ? 'L' : 'M'),
-          exchange: customFields.exchange === 'NSE' ? 'N' : (customFields.exchange === 'BSE' ? 'B' : 'N'),
+          exchange: exchangeToUse === 'NSE' ? 'N' : (exchangeToUse === 'BSE' ? 'B' : 'N'),
           price: customFields.order_type === 'LIMIT' ? (parseFloat(customFields.price) || 0) : 0,
           disclosed_quantity: parseInt(customFields.disclosed_quantity) || 0,
           is_intraday: customFields.product === 'MIS'
@@ -319,8 +328,62 @@ const WebhookSyntaxGenerator: React.FC = () => {
     setGeneratedSyntax({
       broker: config.name,
       config: config,
-      payload: payload
+      payload: payload,
+      symbol_data: selectedSymbolData,
+      validation: symbolValidation
     });
+  };
+
+  const validateSymbolForBroker = async (symbol: string, exchange: string) => {
+    if (!symbol || !exchange || !selectedBroker) return;
+    
+    setValidatingSymbol(true);
+    try {
+      const response = await symbolsAPI.validateSymbol({
+        symbol,
+        exchange,
+        brokerName: selectedBroker
+      });
+      
+      setSymbolValidation(response.data);
+      
+      if (response.data.valid) {
+        setSelectedSymbolData(response.data.mapping);
+        toast.success(`Symbol ${symbol} validated for ${selectedBroker}`);
+      } else {
+        toast.error(response.data.error || 'Symbol not supported by this broker');
+        setSelectedSymbolData(null);
+      }
+    } catch (error) {
+      console.error('Symbol validation failed:', error);
+      toast.error('Failed to validate symbol');
+      setSymbolValidation(null);
+      setSelectedSymbolData(null);
+    } finally {
+      setValidatingSymbol(false);
+    }
+  };
+
+  const generateWebhookPayload = async () => {
+    if (!selectedSymbolData || !selectedBroker) {
+      toast.error('Please select a valid symbol first');
+      return;
+    }
+    
+    try {
+      const response = await symbolsAPI.generateWebhookPayload({
+        symbol: selectedSymbolData.symbol,
+        exchange: selectedSymbolData.exchange,
+        brokerName: selectedBroker,
+        orderParams: customFields
+      });
+      
+      setGeneratedSyntax(response.data);
+      toast.success('Webhook payload generated successfully');
+    } catch (error) {
+      console.error('Failed to generate webhook payload:', error);
+      toast.error('Failed to generate webhook payload');
+    }
   };
 
   const copyToClipboard = (text: string, section: string) => {
@@ -445,6 +508,18 @@ Generated by AutoTraderHub - ${new Date().toISOString()}
             <RefreshCw className="w-4 h-4" />
             <span>Regenerate</span>
           </motion.button>
+          
+          {selectedSymbolData && (
+            <motion.button
+              onClick={generateWebhookPayload}
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              className="flex items-center space-x-2 bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors shadow-3d"
+            >
+              <Zap className="w-4 h-4" />
+              <span>Generate with Validated Data</span>
+            </motion.button>
+          )}
         </div>
       </motion.div>
 
@@ -506,22 +581,84 @@ Generated by AutoTraderHub - ${new Date().toISOString()}
         <div className="space-y-4">
           <SymbolSearch
             onSymbolSelect={(symbol) => {
-              // Get the token for the selected broker
-              const brokerIndex = symbol.supported_brokers.indexOf(selectedBroker);
-              const brokerToken = brokerIndex >= 0 ? symbol.broker_tokens[brokerIndex] : '';
-              
               setCustomFields({
                 ...customFields,
                 symbol: symbol.symbol,
                 exchange: symbol.exchange,
-                symboltoken: brokerToken || customFields.symboltoken
+                symboltoken: symbol.broker_tokens?.[0] || customFields.symboltoken
               });
-              toast.success(`Selected ${symbol.symbol} from ${symbol.exchange}`);
+              
+              // Validate symbol for selected broker
+              validateSymbolForBroker(symbol.symbol, symbol.exchange);
             }}
             selectedBroker={selectedBroker}
             placeholder="Search for trading symbols..."
             className="w-full"
           />
+          
+          {/* Symbol Validation Status */}
+          {validatingSymbol && (
+            <div className="flex items-center space-x-2 text-blue-600">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              <span className="text-sm">Validating symbol for {selectedBroker}...</span>
+            </div>
+          )}
+          
+          {symbolValidation && (
+            <div className={`p-3 rounded-lg border ${
+              symbolValidation.valid 
+                ? 'bg-green-50 border-green-200' 
+                : 'bg-red-50 border-red-200'
+            }`}>
+              <div className="flex items-center space-x-2">
+                {symbolValidation.valid ? (
+                  <CheckCircle className="w-4 h-4 text-green-600" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-red-600" />
+                )}
+                <span className={`text-sm font-medium ${
+                  symbolValidation.valid ? 'text-green-800' : 'text-red-800'
+                }`}>
+                  {symbolValidation.valid 
+                    ? `Symbol validated for ${selectedBroker}` 
+                    : symbolValidation.error
+                  }
+                </span>
+              </div>
+              
+              {symbolValidation.valid && selectedSymbolData && (
+                <div className="mt-2 text-xs text-green-700">
+                  <p><strong>Token:</strong> {selectedSymbolData.broker_token}</p>
+                  <p><strong>Broker Symbol:</strong> {selectedSymbolData.broker_symbol}</p>
+                  <p><strong>Exchange:</strong> {selectedSymbolData.broker_exchange}</p>
+                </div>
+              )}
+              
+              {!symbolValidation.valid && symbolValidation.suggestions?.length > 0 && (
+                <div className="mt-2">
+                  <p className="text-xs text-red-700 mb-1">Similar symbols:</p>
+                  <div className="flex flex-wrap gap-1">
+                    {symbolValidation.suggestions.map((suggestion: any, index: number) => (
+                      <button
+                        key={index}
+                        onClick={() => {
+                          setCustomFields({
+                            ...customFields,
+                            symbol: suggestion.symbol,
+                            exchange: suggestion.exchange
+                          });
+                          validateSymbolForBroker(suggestion.symbol, suggestion.exchange);
+                        }}
+                        className="px-2 py-1 bg-red-100 text-red-800 text-xs rounded hover:bg-red-200 transition-colors"
+                      >
+                        {suggestion.symbol}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
           
           <div className="text-sm text-bronze-600">
             <p>💡 <strong>Tip:</strong> Use the search above to find symbols or enter them manually in the configuration below.</p>
@@ -805,6 +942,24 @@ Generated by AutoTraderHub - ${new Date().toISOString()}
                   <code>{JSON.stringify(generatedSyntax.payload, null, 2)}</code>
                 </pre>
               </div>
+              
+              {/* Symbol Data Display */}
+              {generatedSyntax.symbol_data && (
+                <div className="mt-4 p-4 bg-blue-50 rounded-lg">
+                  <h4 className="font-bold text-blue-800 mb-2 flex items-center">
+                    <Database className="w-4 h-4 mr-1" />
+                    Validated Symbol Data:
+                  </h4>
+                  <div className="grid grid-cols-2 gap-2 text-sm text-blue-700">
+                    <div><strong>Symbol:</strong> {generatedSyntax.symbol_data.symbol}</div>
+                    <div><strong>Exchange:</strong> {generatedSyntax.symbol_data.exchange}</div>
+                    <div><strong>Broker Token:</strong> {generatedSyntax.symbol_data.broker_token}</div>
+                    <div><strong>Broker Symbol:</strong> {generatedSyntax.symbol_data.broker_symbol}</div>
+                    <div><strong>Lot Size:</strong> {generatedSyntax.symbol_data.lot_size}</div>
+                    <div><strong>Tick Size:</strong> {generatedSyntax.symbol_data.tick_size}</div>
+                  </div>
+                </div>
+              )}
               
               <div className="mt-4 p-4 bg-amber-50 rounded-lg">
                 <h4 className="font-bold text-amber-800 mb-2 flex items-center">
