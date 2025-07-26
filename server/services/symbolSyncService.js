@@ -1,7 +1,7 @@
 import axios from 'axios';
 import fs from 'fs/promises';
 import path from 'path';
-import cron from 'node-cron';
+// import cron from 'node-cron'; // Disabled - manual sync only
 import { db } from '../database/init.js';
 import { createLogger } from '../utils/logger.js';
 import { decryptData } from '../utils/encryption.js';
@@ -16,7 +16,7 @@ class SymbolSyncService {
     this.instrumentCache = new Map(); // Cache instrument data
     this.initializeDataDirectory();
     this.initializeDefaultSyncStatus();
-    this.scheduleDailySync();
+    // this.scheduleDailySync(); // Disabled - manual sync only
   }
 
   // Initialize data directory for storing symbol files
@@ -682,6 +682,11 @@ class SymbolSyncService {
       return symbols;
       
     } catch (error) {
+      logger.error('Failed to fetch symbols from Shoonya:', error);
+      return [];
+    }
+  }
+
   // Get cached instrument data for a broker
   getCachedInstruments(brokerName) {
     return this.instrumentCache.get(brokerName) || [];
@@ -772,7 +777,7 @@ class SymbolSyncService {
             instrument_token: symbolData.broker_token
           };
           break;
-      logger.error('Failed to fetch Shoonya symbols:', error);
+
         case 'angel':
           payload = {
             symbol: symbolData.broker_symbol,
@@ -788,7 +793,7 @@ class SymbolSyncService {
             stoploss: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price).toString() : '0'
           };
           break;
-      throw new Error(`Shoonya symbol fetch failed: ${error.message}`);
+
         case 'shoonya':
           payload = {
             symbol: symbolData.symbol,
@@ -802,11 +807,10 @@ class SymbolSyncService {
             trigger_price: ['SL', 'SL-M'].includes(params.order_type) ? parseFloat(params.trigger_price).toString() : '0'
           };
           break;
-    }
+
         default:
           throw new Error(`Unsupported broker: ${brokerName}`);
       }
-  }
       return {
         broker: brokerName,
         symbol_data: symbolData,

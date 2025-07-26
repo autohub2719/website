@@ -3,15 +3,26 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { TrendingUp, User, LogOut, Crown } from 'lucide-react';
 import { isAuthenticated, removeToken } from '../../utils/auth';
+import { authAPI } from '../../services/api';
+import toast from 'react-hot-toast';
 
 const Header: React.FC = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const authenticated = isAuthenticated();
 
-  const handleLogout = () => {
-    removeToken();
-    navigate('/');
+  const handleLogout = async () => {
+    try {
+      await authAPI.logout();
+      removeToken();
+      toast.success('Logged out successfully');
+      navigate('/');
+    } catch (error) {
+      // Even if server logout fails, remove token locally
+      removeToken();
+      toast.success('Logged out successfully');
+      navigate('/');
+    }
   };
 
   const isLandingPage = location.pathname === '/';

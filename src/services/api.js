@@ -30,11 +30,11 @@ api.interceptors.response.use(
   (error) => {
     console.error(`❌ API Error: ${error.config?.method?.toUpperCase()} ${error.config?.url}`, error);
     
-    // Temporarily disable automatic redirect for testing
-    // if (error.response?.status === 401) {
-    //   localStorage.removeItem('authToken');
-    //   window.location.href = '/login';
-    // }
+    // Handle 401 unauthorized responses
+    if (error.response?.status === 401) {
+      localStorage.removeItem('authToken');
+      window.location.href = '/login';
+    }
     
     // Enhanced error information
     if (error.code === 'ECONNREFUSED' || error.code === 'ERR_NETWORK') {
@@ -50,6 +50,7 @@ api.interceptors.response.use(
 export const authAPI = {
   register: (data) => api.post('/auth/register', data),
   login: (data) => api.post('/auth/login', data),
+  logout: () => api.post('/auth/logout'),
   getProfile: () => api.get('/auth/me'),
   verifyOtp: ({ identifier, otp }) => api.post('/auth/verify-otp', { identifier, otp }),
   resendOtp: ({ identifier }) => api.post('/auth/resend-otp', { identifier }),
@@ -209,8 +210,14 @@ export const symbolsAPI = {
   // Get sync status for all brokers
   getSyncStatus: () => api.get('/symbols/sync-status'),
   
+  // Get all symbols with filters
+  getSymbols: (params = {}) => api.get('/symbols', { params }),
+  
   // Sync symbols for all brokers
   syncAllSymbols: () => api.post('/symbols/sync-all'),
+  
+  // Sync symbols for specific broker (alias for syncBrokerSymbols)
+  syncSymbols: (broker) => api.post(`/symbols/sync/${broker}`),
   
   // Sync symbols for specific broker
   syncBrokerSymbols: (broker) => api.post(`/symbols/sync/${broker}`),

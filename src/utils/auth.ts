@@ -11,18 +11,16 @@ export const removeToken = (): void => {
 };
 
 export const isAuthenticated = (): boolean => {
-  // Temporarily return true for testing dashboard routes
-  // This allows access to dashboard without proper authentication
-  return true;
-  
-  // Original authentication logic (commented out for testing)
-  // const token = getToken();
-  // if (!token) return false;
-  //
-  // try {
-  //   const payload = JSON.parse(atob(token.split('.')[1]));
-  //   return payload.exp > Date.now() / 1000;
-  // } catch {
-  //   return false;
-  // }
+  const token = getToken();
+  if (!token) return false;
+
+  try {
+    // Decode JWT token to check expiration
+    const payload = JSON.parse(atob(token.split('.')[1]));
+    return payload.exp > Date.now() / 1000;
+  } catch {
+    // If token is malformed, remove it and return false
+    removeToken();
+    return false;
+  }
 };

@@ -102,23 +102,23 @@ async function startServer() {
     await orderStatusService.startPollingForOpenOrders();
     
     logger.info('Initializing symbol sync service...');
-    // Check if initial sync is needed
-    const syncStatuses = await symbolSyncService.getSyncStatus();
-    const needsInitialSync = syncStatuses.length === 0 || 
-      syncStatuses.some(s => s.sync_status !== 'completed');
-    
-    if (needsInitialSync) {
-      logger.info('Starting initial symbol sync...');
-      symbolSyncService.syncAllBrokers().catch(error => {
-        logger.error('Initial symbol sync failed:', error);
-      });
-    }
+    // Automatic sync disabled - use manual sync from dashboard
+    // const syncStatuses = await symbolSyncService.getSyncStatus();
+    // const needsInitialSync = syncStatuses.length === 0 || 
+    //   syncStatuses.some(s => s.sync_status !== 'completed');
+    // 
+    // if (needsInitialSync) {
+    //   logger.info('Starting initial symbol sync...');
+    //   symbolSyncService.syncAllBrokers().catch(error => {
+    //     logger.error('Initial symbol sync failed:', error);
+    //   });
+    // }
     
     app.listen(PORT, () => {
       logger.info(`🚀 AutoTraderHub API Server running on port ${PORT}`);
       logger.info(`📊 Health check: http://localhost:${PORT}/api/health`);
       logger.info(`🔗 CORS enabled for: ${JSON.stringify(process.env.CORS_ORIGINS || ['localhost:3000', 'localhost:5173'])}`);
-      logger.info(`⏰ Daily symbol sync scheduled for 6:00 AM IST`);
+      logger.info(`⏰ Symbol sync available via dashboard (manual trigger only)`);
     });
   } catch (error) {
     logger.error('Failed to start server:', error);

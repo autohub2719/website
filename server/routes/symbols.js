@@ -29,6 +29,48 @@ router.get('/sync-status', authenticateToken, async (req, res) => {
   }
 });
 
+// Get all symbols with optional filters
+router.get('/', authenticateToken, async (req, res) => {
+  try {
+    const { search, exchange, segment, limit = 100 } = req.query;
+    
+    logger.info('Getting symbols with filters:', { search, exchange, segment, limit });
+    
+    let symbols = [];
+    
+    if (search) {
+      // Use search if provided
+      symbols = await symbolSyncService.enhancedSymbolSearch(search, {
+        exchange,
+        segment,
+        limit: parseInt(limit)
+      });
+    } else {
+      // Get symbols by other filters
+      if (exchange) {
+        symbols = await symbolSyncService.getSymbolsByExchange(exchange, parseInt(limit));
+      } else {
+        // Default to popular symbols if no filters
+        symbols = await symbolSyncService.getPopularSymbols(parseInt(limit));
+      }
+    }
+    
+    res.json({
+      success: true,
+      data: symbols,
+      count: symbols.length
+    });
+    
+  } catch (error) {
+    logger.error('Failed to get symbols:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get symbols',
+      error: error.message
+    });
+  }
+});
+
 // Sync symbols for all brokers
 router.post('/sync-all', authenticateToken, async (req, res) => {
   try {

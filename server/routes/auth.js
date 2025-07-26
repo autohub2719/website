@@ -357,6 +357,19 @@ router.get('/me', authenticateToken, (req, res) => {
   res.json({ user: req.user });
 });
 
+// LOGOUT
+router.post('/logout', authenticateToken, (req, res) => {
+  try {
+    // Since JWTs are stateless, we can't invalidate them server-side without a blacklist
+    // For now, we just send a success response and let the client remove the token
+    // In production, you might want to implement a token blacklist
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ error: 'Logout failed' });
+  }
+});
+
 // FORGOT PASSWORD - Initiate
 router.post('/forgot-password', async (req, res) => {
   try {
